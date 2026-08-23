@@ -1,17 +1,16 @@
-using System.Collections.Generic;
+using System.Data;
 using System.Threading;
 using System.Threading.Tasks;
-using CBMSB2BLink.Core.Models;
+using CBMSB2BLink.Core.Options;
 
 namespace CBMSB2BLink.Core.Abstractions;
 
 /// <summary>
-/// Reads new records from the source system. The SQL implementation calls
-/// usp_GetBCBNewData directly against CCRISB2B. A future HttpSourceRepository can
-/// implement this same contract against the source-side fallback bridge API
-/// (see docs/ARCHITECTURE.md, "Phase 2") without any change to SyncEngine.
+/// Reads one page of new records from a job's source. Column shape comes entirely
+/// from what the job's configured query returns — see
+/// docs/superpowers/specs/2026-08-24-generic-sync-engine-design.md.
 /// </summary>
 public interface ISourceRepository
 {
-    Task<IReadOnlyList<BcbRecord>> GetNewRecordsAsync(long lastRowId, int batchSize, CancellationToken cancellationToken);
+    Task<DataTable> GetNewRecordsAsync(SourceJobOptions source, long lastRowId, int batchSize, int commandTimeoutSeconds, CancellationToken cancellationToken);
 }

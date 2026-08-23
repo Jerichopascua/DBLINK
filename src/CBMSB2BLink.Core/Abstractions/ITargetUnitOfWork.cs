@@ -6,12 +6,11 @@ using System.Threading.Tasks;
 namespace CBMSB2BLink.Core.Abstractions;
 
 /// <summary>
-/// A single open CBMS connection + transaction shared by the destination insert and the
-/// SyncControl/SyncRunHistory writes for one sync run, so they commit or roll back
-/// together (see SyncEngine step 5 — atomicity is what makes reruns after a crash safe
-/// without needing a dedup column).
+/// A single open target-database connection + transaction shared by the destination
+/// insert and the SyncRunHistory write for one job's run, so they commit or roll back
+/// together — a crash mid-run leaves that job's target DB untouched for that run.
 /// </summary>
-public interface ICbmsUnitOfWork : IAsyncDisposable
+public interface ITargetUnitOfWork : IAsyncDisposable
 {
     DbTransaction Transaction { get; }
 
