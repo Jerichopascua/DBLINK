@@ -7,14 +7,14 @@ using Microsoft.Data.SqlClient;
 
 namespace CBMSB2BLink.Data;
 
-public sealed class CbmsUnitOfWork : ICbmsUnitOfWork
+public sealed class TargetUnitOfWork : ITargetUnitOfWork
 {
     private readonly string _connectionString;
     private SqlConnection? _connection;
     private SqlTransaction? _transaction;
     private bool _completed;
 
-    public CbmsUnitOfWork(string connectionString)
+    public TargetUnitOfWork(string connectionString)
     {
         _connectionString = connectionString;
     }
