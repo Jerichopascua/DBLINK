@@ -1,0 +1,18 @@
+{
+  "Sync": {
+    "Jobs": [
+      {
+        "JobKey": "BCB_NEW2",
+        "Source": {
+          "ConnectionString": "Server=YOUR_SERVER\\SQLEXPRESS;Database=CCRISB2B;User Id=sa;Password=YOUR_PASSWORD;TrustServerCertificate=True;"
+        },
+        "Target": {
+          "ConnectionString": "Server=YOUR_SERVER\\SQLEXPRESS;Database=CBMS;User Id=sa;Password=YOUR_PASSWORD;TrustServerCertificate=True;"
+        }
+      }
+    ]
+  },
+  "Email": {
+    "EnableOnFailure": false
+  }
+}

@@ -1,5 +1,5 @@
 using System;
-using System.ComponentModel.DataAnnotations;
+using System.Linq;
 using System.Threading.Tasks;
 using CBMSB2BLink.App.Infrastructure;
 using CBMSB2BLink.Core;
@@ -13,10 +13,6 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Serilog;
 
-// CBMSB2BLink is a Windows Task Scheduler console app (DPAPI secret protection is
-// Windows-only); this silences the cross-platform CA1416 analyzer for that call site.
-[assembly: System.Runtime.Versioning.SupportedOSPlatform("windows")]
-
 namespace CBMSB2BLink.App;
 
 public static class Program
@@ -28,32 +24,13 @@ public static class Program
                 loggerConfiguration.ReadFrom.Configuration(context.Configuration))
             .ConfigureServices((context, services) =>
             {
-                services.AddOptions<ConnectionStringsOptions>()
-                    .Bind(context.Configuration.GetSection(ConnectionStringsOptions.SectionName))
-                    .ValidateDataAnnotations()
-                    .ValidateOnStart();
-
                 services.AddOptions<SyncOptions>()
                     .Bind(context.Configuration.GetSection(SyncOptions.SectionName))
-                    .ValidateDataAnnotations()
                     .ValidateOnStart();
+                services.AddSingleton<IValidateOptions<SyncOptions>, SyncOptionsValidator>();
 
                 services.AddOptions<EmailOptions>()
                     .Bind(context.Configuration.GetSection(EmailOptions.SectionName));
-
-                // Decrypt "DPAPI:<blob>" connection strings after binding, before any repository uses them.
-                services.PostConfigure<ConnectionStringsOptions>(options =>
-                {
-                    if (DpapiProtector.IsProtected(options.CcrisB2B))
-                    {
-                        options.CcrisB2B = DpapiProtector.Unprotect(options.CcrisB2B);
-                    }
-
-                    if (DpapiProtector.IsProtected(options.Cbms))
-                    {
-                        options.Cbms = DpapiProtector.Unprotect(options.Cbms);
-                    }
-                });
 
                 services.AddCbmsB2BLinkData();
                 services.AddSingleton<IRunLock, FileRunLock>();
@@ -75,9 +52,9 @@ public static class Program
             cts.CancelAfter(TimeSpan.FromSeconds(syncOptions.MaxRunDurationSeconds));
 
             var engine = host.Services.GetRequiredService<SyncEngine>();
-            var result = await engine.RunAsync(cts.Token);
+            var results = await engine.RunAsync(cts.Token);
 
-            return result.Status == SyncRunStatus.Failed ? 1 : 0;
+            return results.Any(r => r.Status == SyncRunStatus.Failed) ? 1 : 0;
         }
         catch (OptionsValidationException ex)
         {
