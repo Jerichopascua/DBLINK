@@ -13,5 +13,5 @@ namespace CBMSB2BLink.Core.Abstractions;
 /// </summary>
 public interface IDestinationRepository
 {
-    Task<InsertBatchResult> InsertBatchAsync(ITargetUnitOfWork unitOfWork, string targetTable, IReadOnlyList<string> targetColumns, DataTable records, CancellationToken cancellationToken);
+    Task<InsertBatchResult> InsertBatchAsync(ITargetUnitOfWork unitOfWork, string targetTable, IReadOnlyList<string> targetColumns, DataTable records, int commandTimeoutSeconds, CancellationToken cancellationToken);
 }

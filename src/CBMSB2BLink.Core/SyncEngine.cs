@@ -59,14 +59,16 @@ public sealed class SyncEngine
         if (heldLock is null)
         {
             _logger.LogWarning("Another CBMSB2BLink run already holds the lock. Exiting without action.");
-            results.Add(new SyncRunResult
+            var lockResult = new SyncRunResult
             {
                 SyncKey = "(lock)",
                 StartedUtc = DateTime.UtcNow,
                 CompletedUtc = DateTime.UtcNow,
                 Status = SyncRunStatus.Failed,
                 ErrorMessage = "Skipped: another run is already in progress (lock held)."
-            });
+            };
+            results.Add(lockResult);
+            await TryNotifyFailureAsync(results, cancellationToken);
             return results;
         }
 
@@ -125,10 +127,13 @@ public sealed class SyncEngine
             await uow.InitializeAsync(cancellationToken);
             try
             {
-                var insertResult = await _destinationRepository.InsertBatchAsync(uow, job.Target.Table, job.Target.Columns, batch, cancellationToken);
+                var insertResult = await _destinationRepository.InsertBatchAsync(uow, job.Target.Table, job.Target.Columns, batch, job.CommandTimeoutSeconds, cancellationToken);
                 result.RecordsInserted = insertResult.RecordsInserted;
-                result.CmsNoFrom = insertResult.CmsNoFrom;
-                result.CmsNoTo = insertResult.CmsNoTo;
+                // The key is copied straight through from source column 0 to
+                // Target.Columns[0], never target-generated — so the inserted range is
+                // always identical to SourceRowIdFrom/To, already computed above.
+                result.CmsNoFrom = result.SourceRowIdFrom;
+                result.CmsNoTo = result.SourceRowIdTo;
 
                 result.Status = SyncRunStatus.Success;
                 result.CompletedUtc = DateTime.UtcNow;
@@ -163,9 +168,11 @@ public sealed class SyncEngine
     }
 
     /// <summary>
-    /// Pulls every page for one job. The first page's column count is checked against
-    /// job.Target.Columns.Count before any further paging or insert happens — a
-    /// mismatch fails the job immediately with no partial work.
+    /// Pulls every page for one job. Every page's column count is checked against
+    /// job.Target.Columns.Count before it's used — a mismatch (page 1, or any later
+    /// page if the source query's shape ever varies by parameter) fails the job
+    /// immediately with a clear error, no partial work and no raw ImportRow schema
+    /// exception.
     /// </summary>
     private async Task<DataTable> PullAllPagesAsync(SyncJobOptions job, CancellationToken cancellationToken)
     {
@@ -176,14 +183,14 @@ public sealed class SyncEngine
         {
             var page = await _sourceRepository.GetNewRecordsAsync(job.Source, cursor, job.BatchSize, job.CommandTimeoutSeconds, cancellationToken);
 
+            if (page.Columns.Count != job.Target.Columns.Count)
+            {
+                throw new InvalidOperationException(
+                    $"Job {job.JobKey}: source query returned {page.Columns.Count} column(s) but Target.Columns configures {job.Target.Columns.Count}. Fix the job's Target.Columns list or the source query.");
+            }
+
             if (all is null)
             {
-                if (page.Columns.Count != job.Target.Columns.Count)
-                {
-                    throw new InvalidOperationException(
-                        $"Job {job.JobKey}: source query returned {page.Columns.Count} column(s) but Target.Columns configures {job.Target.Columns.Count}. Fix the job's Target.Columns list or the source query.");
-                }
-
                 all = page;
             }
             else

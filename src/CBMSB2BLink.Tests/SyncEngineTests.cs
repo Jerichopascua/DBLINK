@@ -77,8 +77,8 @@ public class SyncEngineTests
     public async Task RunAsync_HappyPath_RecordsRunAndCommits()
     {
         SetupSource("usp_Test_JOB1", Page(101, 102, 103));
-        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 3, CmsNoFrom = 101, CmsNoTo = 103 });
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 3 });
 
         var engine = CreateEngine();
         var results = await engine.RunAsync(CancellationToken.None);
@@ -104,7 +104,7 @@ public class SyncEngineTests
         var results = await engine.RunAsync(CancellationToken.None);
 
         Assert.Equal(SyncRunStatus.NoNewData, results[0].Status);
-        _destination.Verify(x => x.InsertBatchAsync(It.IsAny<ITargetUnitOfWork>(), It.IsAny<string>(), It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<CancellationToken>()), Times.Never);
+        _destination.Verify(x => x.InsertBatchAsync(It.IsAny<ITargetUnitOfWork>(), It.IsAny<string>(), It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
         _syncRunHistory.Verify(x => x.RecordRunAsync(_uow.Object, It.Is<SyncRunResult>(r => r.Status == SyncRunStatus.NoNewData), It.IsAny<CancellationToken>()), Times.Once);
         _uow.Verify(x => x.CommitAsync(It.IsAny<CancellationToken>()), Times.Once);
     }
@@ -124,7 +124,7 @@ public class SyncEngineTests
         Assert.Equal(SyncRunStatus.Failed, results[0].Status);
         Assert.Contains("1 column(s)", results[0].ErrorMessage);
         Assert.Contains("configures 2", results[0].ErrorMessage);
-        _destination.Verify(x => x.InsertBatchAsync(It.IsAny<ITargetUnitOfWork>(), It.IsAny<string>(), It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<CancellationToken>()), Times.Never);
+        _destination.Verify(x => x.InsertBatchAsync(It.IsAny<ITargetUnitOfWork>(), It.IsAny<string>(), It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -138,8 +138,8 @@ public class SyncEngineTests
             .ThrowsAsync(new InvalidOperationException("source unreachable"));
 
         SetupSource("usp_Test_JOB2", Page(201));
-        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 1, CmsNoFrom = 201, CmsNoTo = 201 });
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 1 });
 
         var engine = CreateEngine();
         var results = await engine.RunAsync(CancellationToken.None);
@@ -159,7 +159,7 @@ public class SyncEngineTests
     public async Task RunAsync_DestinationInsertFails_RollsBackAndRecordsFailure()
     {
         SetupSource("usp_Test_JOB1", Page(101));
-        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<CancellationToken>()))
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("insert failed"));
 
         var engine = CreateEngine();
@@ -184,8 +184,8 @@ public class SyncEngineTests
             .ReturnsAsync(Page(1, 2))
             .ReturnsAsync(Page(3));
 
-        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 3), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 3, CmsNoFrom = 1, CmsNoTo = 3 });
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 3), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 3 });
 
         var engine = CreateEngine();
         var results = await engine.RunAsync(CancellationToken.None);
@@ -198,7 +198,7 @@ public class SyncEngineTests
     }
 
     [Fact]
-    public async Task RunAsync_LockHeld_ReturnsFailedWithoutRunningAnyJob()
+    public async Task RunAsync_LockHeld_ReturnsFailedWithoutRunningAnyJobAndNotifies()
     {
         _runLock.Setup(x => x.TryAcquireAsync(It.IsAny<CancellationToken>())).ReturnsAsync((IDisposable?)null);
 
@@ -208,6 +208,10 @@ public class SyncEngineTests
         Assert.Single(results);
         Assert.Equal(SyncRunStatus.Failed, results[0].Status);
         _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), It.IsAny<long>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
-        _notification.Verify(x => x.SendFailureAsync(It.IsAny<IReadOnlyList<SyncRunResult>>(), It.IsAny<CancellationToken>()), Times.Never);
+        // Lock contention is a real operational signal (a stuck/overlapping run) and now
+        // notifies like any other job failure, instead of failing silently.
+        _notification.Verify(x => x.SendFailureAsync(
+            It.Is<IReadOnlyList<SyncRunResult>>(list => list.Count == 1 && list[0].SyncKey == "(lock)"),
+            It.IsAny<CancellationToken>()), Times.Once);
     }
 }
