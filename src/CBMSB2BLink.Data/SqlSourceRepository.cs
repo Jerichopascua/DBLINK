@@ -23,9 +23,17 @@ public sealed class SqlSourceRepository : ISourceRepository
     private sealed class BcbRecordRow
     {
         public long ROWID { get; init; }
-        public string IDNO { get; init; } = string.Empty;
-        public System.DateTime CREATEDATE { get; init; }
-        public decimal AMOUNT { get; init; }
+        public int BCB_CMS_No { get; init; }
+        public string? BCB_IdNo1 { get; init; }
+        public string? BCB_IdNo2 { get; init; }
+        public string? BCB_Name1 { get; init; }
+        public string? BCB_DOB { get; init; }
+        public string? BCB_Nationality { get; init; }
+        public System.DateTime? BCB_CreateDate { get; init; }
+        public string? BCB_LastUpdateBy { get; init; }
+        public string? BCB_ENTKEY { get; init; }
+        public string? BCB_RefNo { get; init; }
+        public string? BCB_SCR_Scored_TxnCode { get; init; }
     }
 
     private readonly string _connectionString;
@@ -55,9 +63,17 @@ public sealed class SqlSourceRepository : ISourceRepository
             .Select(r => new BcbRecord
             {
                 RowId = r.ROWID,
-                IdNo = r.IDNO,
-                CreateDate = r.CREATEDATE,
-                Amount = r.AMOUNT
+                BcbCmsNo = r.BCB_CMS_No,
+                BcbIdNo1 = r.BCB_IdNo1,
+                BcbIdNo2 = r.BCB_IdNo2,
+                BcbName1 = r.BCB_Name1,
+                BcbDob = r.BCB_DOB,
+                BcbNationality = r.BCB_Nationality,
+                BcbCreateDate = r.BCB_CreateDate,
+                BcbLastUpdateBy = r.BCB_LastUpdateBy,
+                BcbEntKey = r.BCB_ENTKEY,
+                BcbRefNo = r.BCB_RefNo,
+                BcbScrScoredTxnCode = r.BCB_SCR_Scored_TxnCode
             })
             .OrderBy(r => r.RowId)
             .ToList();

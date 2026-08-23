@@ -11,11 +11,10 @@ using Microsoft.Extensions.Options;
 namespace CBMSB2BLink.Data;
 
 /// <summary>
-/// Inserts a batch into CBMS dbo.BCB_NEW via a table-valued parameter (dbo.BcbRecordTableType,
-/// see sql/01_CreateSyncControlAndRunHistory_CBMS.sql) and captures the generated CMS_NO
-/// range from OUTPUT INSERTED.CMS_NO. A TVP is used instead of SqlBulkCopy because
-/// SqlBulkCopy does not reliably surface generated identity values, and we need the
-/// CmsNo range for the SyncControl watermark.
+/// Inserts a batch into CBMS dbo.BCB_NEW2 via a table-valued parameter
+/// (dbo.BcbRecordTableType, see sql/01_CreateSyncRunHistory_CBMS.sql). No dedup filter
+/// here — the CCRISB2B-side usp_GetBCBNewData is responsible for never returning an
+/// already-sent row (see docs/superpowers/specs/2026-08-23-bcb-new2-pipeline-design.md).
 /// </summary>
 public sealed class SqlDestinationRepository : IDestinationRepository
 {
@@ -31,21 +30,45 @@ public sealed class SqlDestinationRepository : IDestinationRepository
         var uow = (CbmsUnitOfWork)unitOfWork;
 
         var table = new DataTable();
-        table.Columns.Add("IdNo", typeof(string));
-        table.Columns.Add("CreateDate", typeof(System.DateTime));
-        table.Columns.Add("Amount", typeof(decimal));
+        table.Columns.Add("BCB_CMS_No", typeof(int));
+        table.Columns.Add("BCB_IdNo1", typeof(string));
+        table.Columns.Add("BCB_IdNo2", typeof(string));
+        table.Columns.Add("BCB_Name1", typeof(string));
+        table.Columns.Add("BCB_DOB", typeof(string));
+        table.Columns.Add("BCB_Nationality", typeof(string));
+        table.Columns.Add("BCB_CreateDate", typeof(System.DateTime));
+        table.Columns.Add("BCB_LastUpdateBy", typeof(string));
+        table.Columns.Add("BCB_ENTKEY", typeof(string));
+        table.Columns.Add("BCB_RefNo", typeof(string));
+        table.Columns.Add("BCB_SCR_Scored_TxnCode", typeof(string));
+
         foreach (var record in records)
         {
-            table.Rows.Add(record.IdNo, record.CreateDate, record.Amount);
+            table.Rows.Add(
+                record.BcbCmsNo,
+                record.BcbIdNo1,
+                record.BcbIdNo2,
+                record.BcbName1,
+                record.BcbDob,
+                record.BcbNationality,
+                record.BcbCreateDate,
+                record.BcbLastUpdateBy,
+                record.BcbEntKey,
+                record.BcbRefNo,
+                record.BcbScrScoredTxnCode);
         }
 
         var command = uow.Connection.CreateCommand();
         command.Transaction = (SqlTransaction)unitOfWork.Transaction;
         command.CommandTimeout = _commandTimeoutSeconds;
         command.CommandText = @"
-INSERT INTO dbo.BCB_NEW (IDNO, CREATEDATE, AMOUNT)
-OUTPUT INSERTED.CMS_NO
-SELECT IdNo, CreateDate, Amount FROM @Records;";
+INSERT INTO dbo.BCB_NEW2
+    (BCB_CMS_No, BCB_IdNo1, BCB_IdNo2, BCB_Name1, BCB_DOB, BCB_Nationality,
+     BCB_CreateDate, BCB_LastUpdateBy, BCB_ENTKEY, BCB_RefNo, BCB_SCR_Scored_TxnCode)
+OUTPUT INSERTED.BCB_CMS_No
+SELECT BCB_CMS_No, BCB_IdNo1, BCB_IdNo2, BCB_Name1, BCB_DOB, BCB_Nationality,
+       BCB_CreateDate, BCB_LastUpdateBy, BCB_ENTKEY, BCB_RefNo, BCB_SCR_Scored_TxnCode
+FROM @Records;";
 
         var tvp = command.Parameters.AddWithValue("@Records", table);
         tvp.SqlDbType = SqlDbType.Structured;
@@ -59,7 +82,7 @@ SELECT IdNo, CreateDate, Amount FROM @Records;";
         {
             while (await reader.ReadAsync(cancellationToken))
             {
-                var cmsNo = reader.GetInt64(0);
+                var cmsNo = reader.GetInt32(0);
                 count++;
                 if (min is null || cmsNo < min) min = cmsNo;
                 if (max is null || cmsNo > max) max = cmsNo;
