@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using CBMSB2BLink.Core.Abstractions;
@@ -12,15 +14,18 @@ using Microsoft.Extensions.Options;
 namespace CBMSB2BLink.Core;
 
 /// <summary>
-/// Orchestrates one CCRISB2B -> CBMS sync run: acquire lock, read watermark, pull new
-/// records in pages, insert + advance watermark atomically, notify on failure.
+/// Orchestrates one CBMSB2BLink run: acquire one process-level lock, then run every
+/// configured job in Sync:Jobs, in order, isolated (one job failing does not stop the
+/// others). CBMSB2BLink does not track a resume watermark itself for any job — each
+/// job's source query is responsible for knowing what's already been sent (see
+/// ISourceRepository).
 /// </summary>
 public sealed class SyncEngine
 {
     private readonly ISourceRepository _sourceRepository;
     private readonly IDestinationRepository _destinationRepository;
-    private readonly ISyncControlRepository _syncControlRepository;
-    private readonly ICbmsUnitOfWorkFactory _unitOfWorkFactory;
+    private readonly ISyncRunHistoryRepository _syncRunHistoryRepository;
+    private readonly ITargetUnitOfWorkFactory _unitOfWorkFactory;
     private readonly INotificationService _notificationService;
     private readonly IRunLock _runLock;
     private readonly SyncOptions _options;
@@ -29,8 +34,8 @@ public sealed class SyncEngine
     public SyncEngine(
         ISourceRepository sourceRepository,
         IDestinationRepository destinationRepository,
-        ISyncControlRepository syncControlRepository,
-        ICbmsUnitOfWorkFactory unitOfWorkFactory,
+        ISyncRunHistoryRepository syncRunHistoryRepository,
+        ITargetUnitOfWorkFactory unitOfWorkFactory,
         INotificationService notificationService,
         IRunLock runLock,
         IOptions<SyncOptions> options,
@@ -38,7 +43,7 @@ public sealed class SyncEngine
     {
         _sourceRepository = sourceRepository;
         _destinationRepository = destinationRepository;
-        _syncControlRepository = syncControlRepository;
+        _syncRunHistoryRepository = syncRunHistoryRepository;
         _unitOfWorkFactory = unitOfWorkFactory;
         _notificationService = notificationService;
         _runLock = runLock;
@@ -46,75 +51,95 @@ public sealed class SyncEngine
         _logger = logger;
     }
 
-    public async Task<SyncRunResult> RunAsync(CancellationToken cancellationToken)
+    public async Task<List<SyncRunResult>> RunAsync(CancellationToken cancellationToken)
     {
-        var stopwatch = Stopwatch.StartNew();
-        var result = new SyncRunResult
-        {
-            SyncKey = _options.SyncKey,
-            StartedUtc = DateTime.UtcNow
-        };
+        var results = new List<SyncRunResult>();
 
         using var heldLock = await _runLock.TryAcquireAsync(cancellationToken);
         if (heldLock is null)
         {
             _logger.LogWarning("Another CBMSB2BLink run already holds the lock. Exiting without action.");
-            result.Status = SyncRunStatus.Failed;
-            result.ErrorMessage = "Skipped: another run is already in progress (lock held).";
-            result.CompletedUtc = DateTime.UtcNow;
-            return result;
+            results.Add(new SyncRunResult
+            {
+                SyncKey = "(lock)",
+                StartedUtc = DateTime.UtcNow,
+                CompletedUtc = DateTime.UtcNow,
+                Status = SyncRunStatus.Failed,
+                ErrorMessage = "Skipped: another run is already in progress (lock held)."
+            });
+            return results;
         }
+
+        foreach (var job in _options.Jobs)
+        {
+            var result = await RunJobAsync(job, cancellationToken);
+            results.Add(result);
+        }
+
+        var failed = results.Where(r => r.Status == SyncRunStatus.Failed).ToList();
+        if (failed.Count > 0)
+        {
+            await TryNotifyFailureAsync(failed, cancellationToken);
+        }
+
+        return results;
+    }
+
+    private async Task<SyncRunResult> RunJobAsync(SyncJobOptions job, CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var result = new SyncRunResult
+        {
+            SyncKey = job.JobKey,
+            StartedUtc = DateTime.UtcNow
+        };
 
         try
         {
-            var watermark = await _syncControlRepository.GetWatermarkAsync(_options.SyncKey, cancellationToken);
-            _logger.LogInformation("Starting sync for {SyncKey} from LastRowId={LastRowId}", _options.SyncKey, watermark.LastRowId);
+            _logger.LogInformation("Starting sync for {JobKey}", job.JobKey);
 
-            var batch = await PullAllPagesAsync(watermark.LastRowId, cancellationToken);
-            result.RecordsRead = batch.Count;
+            await _syncRunHistoryRepository.EnsureSchemaAsync(job.Target.ConnectionString, cancellationToken);
 
-            if (batch.Count == 0)
+            var batch = await PullAllPagesAsync(job, cancellationToken);
+            result.RecordsRead = batch.Rows.Count;
+
+            if (batch.Rows.Count == 0)
             {
-                _logger.LogInformation("No new records for {SyncKey}.", _options.SyncKey);
+                _logger.LogInformation("No new records for {JobKey}.", job.JobKey);
                 result.Status = SyncRunStatus.NoNewData;
                 result.CompletedUtc = DateTime.UtcNow;
                 result.DurationMs = (int)stopwatch.ElapsedMilliseconds;
 
-                await using var noopUow = _unitOfWorkFactory.Create();
+                await using var noopUow = _unitOfWorkFactory.Create(job.Target.ConnectionString);
                 await noopUow.InitializeAsync(cancellationToken);
-                await _syncControlRepository.RecordRunAsync(noopUow, result, cancellationToken);
+                await _syncRunHistoryRepository.RecordRunAsync(noopUow, result, cancellationToken);
                 await noopUow.CommitAsync(cancellationToken);
 
                 return result;
             }
 
-            result.SourceRowIdFrom = batch[0].RowId;
-            result.SourceRowIdTo = batch[^1].RowId;
+            result.SourceRowIdFrom = Convert.ToInt64(batch.Rows[0][0]);
+            result.SourceRowIdTo = Convert.ToInt64(batch.Rows[batch.Rows.Count - 1][0]);
 
-            await using var uow = _unitOfWorkFactory.Create();
+            await using var uow = _unitOfWorkFactory.Create(job.Target.ConnectionString);
             await uow.InitializeAsync(cancellationToken);
             try
             {
-                var insertResult = await _destinationRepository.InsertBatchAsync(uow, batch, cancellationToken);
+                var insertResult = await _destinationRepository.InsertBatchAsync(uow, job.Target.Table, job.Target.Columns, batch, cancellationToken);
                 result.RecordsInserted = insertResult.RecordsInserted;
                 result.CmsNoFrom = insertResult.CmsNoFrom;
                 result.CmsNoTo = insertResult.CmsNoTo;
-
-                await _syncControlRepository.UpdateWatermarkAsync(
-                    uow, _options.SyncKey, result.SourceRowIdTo.Value, result.CmsNoTo, cancellationToken);
 
                 result.Status = SyncRunStatus.Success;
                 result.CompletedUtc = DateTime.UtcNow;
                 result.DurationMs = (int)stopwatch.ElapsedMilliseconds;
 
-                await _syncControlRepository.RecordRunAsync(uow, result, cancellationToken);
-
+                await _syncRunHistoryRepository.RecordRunAsync(uow, result, cancellationToken);
                 await uow.CommitAsync(cancellationToken);
 
                 _logger.LogInformation(
-                    "Sync succeeded for {SyncKey}: {RecordsInserted} records, RowId {From}-{To}, CmsNo {CmsFrom}-{CmsTo}, {DurationMs}ms",
-                    _options.SyncKey, result.RecordsInserted, result.SourceRowIdFrom, result.SourceRowIdTo,
-                    result.CmsNoFrom, result.CmsNoTo, result.DurationMs);
+                    "Sync succeeded for {JobKey}: {RecordsInserted} records, RowId {From}-{To}, {DurationMs}ms",
+                    job.JobKey, result.RecordsInserted, result.SourceRowIdFrom, result.SourceRowIdTo, result.DurationMs);
 
                 return result;
             }
@@ -126,65 +151,86 @@ public sealed class SyncEngine
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Sync run failed for {SyncKey}", _options.SyncKey);
+            _logger.LogError(ex, "Sync run failed for {JobKey}", job.JobKey);
             result.Status = SyncRunStatus.Failed;
             result.ErrorMessage = ex.ToString();
             result.CompletedUtc = DateTime.UtcNow;
             result.DurationMs = (int)stopwatch.ElapsedMilliseconds;
 
-            await TryRecordFailedRunAsync(result, cancellationToken);
-            await TryNotifyFailureAsync(result, cancellationToken);
-
+            await TryRecordFailedRunAsync(job, result, cancellationToken);
             return result;
         }
     }
 
-    private async Task<List<BcbRecord>> PullAllPagesAsync(long lastRowId, CancellationToken cancellationToken)
+    /// <summary>
+    /// Pulls every page for one job. The first page's column count is checked against
+    /// job.Target.Columns.Count before any further paging or insert happens — a
+    /// mismatch fails the job immediately with no partial work.
+    /// </summary>
+    private async Task<DataTable> PullAllPagesAsync(SyncJobOptions job, CancellationToken cancellationToken)
     {
-        var all = new List<BcbRecord>();
-        var cursor = lastRowId;
+        DataTable? all = null;
+        var cursor = 0L;
 
         while (true)
         {
-            var page = await _sourceRepository.GetNewRecordsAsync(cursor, _options.BatchSize, cancellationToken);
-            if (page.Count == 0)
+            var page = await _sourceRepository.GetNewRecordsAsync(job.Source, cursor, job.BatchSize, job.CommandTimeoutSeconds, cancellationToken);
+
+            if (all is null)
+            {
+                if (page.Columns.Count != job.Target.Columns.Count)
+                {
+                    throw new InvalidOperationException(
+                        $"Job {job.JobKey}: source query returned {page.Columns.Count} column(s) but Target.Columns configures {job.Target.Columns.Count}. Fix the job's Target.Columns list or the source query.");
+                }
+
+                all = page;
+            }
+            else
+            {
+                foreach (DataRow row in page.Rows)
+                {
+                    all.ImportRow(row);
+                }
+            }
+
+            if (page.Rows.Count == 0)
             {
                 break;
             }
 
-            all.AddRange(page);
-            cursor = page[^1].RowId;
+            cursor = Convert.ToInt64(page.Rows[page.Rows.Count - 1][0]);
 
-            if (page.Count < _options.BatchSize)
+            if (page.Rows.Count < job.BatchSize)
             {
                 break;
             }
         }
 
-        return all;
+        return all!;
     }
 
-    private async Task TryRecordFailedRunAsync(SyncRunResult result, CancellationToken cancellationToken)
+    private async Task TryRecordFailedRunAsync(SyncJobOptions job, SyncRunResult result, CancellationToken cancellationToken)
     {
         try
         {
-            await _syncControlRepository.RecordFailedRunAsync(result, cancellationToken);
+            await _syncRunHistoryRepository.RecordFailedRunAsync(job.Target.ConnectionString, result, cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to record failed-run history for {SyncKey}", result.SyncKey);
+            _logger.LogError(ex, "Failed to record failed-run history for {JobKey}", result.SyncKey);
         }
     }
 
-    private async Task TryNotifyFailureAsync(SyncRunResult result, CancellationToken cancellationToken)
+    private async Task TryNotifyFailureAsync(IReadOnlyList<SyncRunResult> failedResults, CancellationToken cancellationToken)
     {
         try
         {
-            await _notificationService.SendFailureAsync(result, cancellationToken);
+            await _notificationService.SendFailureAsync(failedResults, cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to send failure notification for {SyncKey}", result.SyncKey);
+            _logger.LogError(ex, "Failed to send failure notification for {Count} failed job(s)", failedResults.Count);
         }
     }
 }
