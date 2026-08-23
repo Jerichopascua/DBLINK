@@ -17,7 +17,7 @@ CBMSB2BLink Windows Console
                        │     │
                        ▼     ▼
                 CCRISB2B     CBMS
-                 tblRPT(ROWID,IDNO,CREATEDATE,AMOUNT)     BCB_NEW (CMS_NO,IDNO,CREATEDATE,AMOUNT)
+     src_tblRetRpt/src_tblCRARawReport (see sql/source_CCRISB2B_01.sql)     BCB_NEW2 (BCB_CMS_No, BCB_IdNo1, ... — see sql/01_CreateSyncRunHistory_CBMS.sql)
 
 1. Read config
 
@@ -35,7 +35,7 @@ CBMSB2BLink Windows Console
 5. Connect CBMS
 
 6. Bulk insert into:
-   BCB_NEW
+   BCB_NEW2
 
 7. Update SyncControl
 
