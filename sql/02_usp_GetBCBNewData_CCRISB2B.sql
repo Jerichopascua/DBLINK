@@ -5,11 +5,16 @@
 -- this proc (see git history) as part of the full cutover documented in
 -- docs/superpowers/specs/2026-08-23-bcb-new2-pipeline-design.md.
 --
--- Contract expected by SqlSourceRepository.GetNewRecordsAsync:
+-- Contract expected by the generic sync engine's SqlSourceRepository (see
+-- docs/superpowers/specs/2026-08-24-generic-sync-engine-design.md):
 --   EXEC usp_GetBCBNewData @LastRowId = <bigint>, @BatchSize = <int>
---   Returns columns: RowID, BCB_CMS_No, BCB_IdNo1, BCB_IdNo2, BCB_Name1, BCB_DOB,
---   BCB_Nationality, BCB_CreateDate, BCB_LastUpdateBy, BCB_ENTKEY, BCB_RefNo,
---   BCB_SCR_Scored_TxnCode — ordered by RowID ascending, at most @BatchSize rows.
+--   Returns exactly the 11 columns configured in this job's Target.Columns (BCB_NEW2's
+--   shape): BCB_CMS_No, BCB_IdNo1, BCB_IdNo2, BCB_Name1, BCB_DOB, BCB_Nationality,
+--   BCB_CreateDate, BCB_LastUpdateBy, BCB_ENTKEY, BCB_RefNo, BCB_SCR_Scored_TxnCode —
+--   ordered by BCB_CMS_No ascending, at most @BatchSize rows. BCB_CMS_No (column 0) is
+--   both the key (= src_tblRetRpt.RowID, used for @LastRowId paging) and the first
+--   column copied into BCB_NEW2 — never returned as a separate RowID column, since the
+--   engine's field-count check requires exactly Target.Columns.Count columns back.
 --
 -- Dedup/resume tracking lives entirely here (CBMSB2BLink keeps no watermark of its
 -- own — see docs/ARCHITECTURE.md, "No CBMS-side watermark"): dbo.CbmsB2BLink_SentLog
@@ -128,7 +133,6 @@ BEGIN
     WHEN NOT MATCHED THEN
         INSERT (RowID, SentUtc) VALUES (b.RowID, SYSUTCDATETIME())
     OUTPUT
-        b.RowID,
         b.BCB_CMS_No, b.BCB_IdNo1, b.BCB_IdNo2, b.BCB_Name1, b.BCB_DOB, b.BCB_Nationality,
         b.BCB_CreateDate, b.BCB_LastUpdateBy, b.BCB_ENTKEY, b.BCB_RefNo, b.BCB_SCR_Scored_TxnCode;
 END

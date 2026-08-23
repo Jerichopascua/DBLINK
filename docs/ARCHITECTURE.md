@@ -2,13 +2,14 @@
 
 ## Purpose
 
-CBMSB2BLink is a scheduled .NET 6 Windows console app that copies new rows from
-CCRISB2B (`src_tblRetRpt`/`src_tblCRARawReport`) into CBMS (`BCB_NEW2`). It keeps **no
-resume watermark of its own** — the source-side stored procedure (`usp_GetBCBNewData`,
-owned/managed on the CCRISB2B side) is responsible for knowing what's already been sent
-and excluding it. CBMSB2BLink only writes an audit trail of what each run did
-(`SyncRunHistory`) — that table is history, not something the app reads back to decide
-what to pull next.
+CBMSB2BLink is a scheduled .NET 6 Windows console app that runs a configured list of
+independent sync jobs (`Sync:Jobs`), each copying new rows from its own source
+database/query into its own target table. It keeps **no resume watermark of its own**
+for any job — each job's source query is responsible for knowing what's already been
+sent and excluding it. CBMSB2BLink only writes an audit trail of what each job's run
+did (`SyncRunHistory`, in that job's own target database) — that table is history, not
+something the app reads back to decide what to pull next. One job failing does not
+stop the others in the same run (see "Multi-job orchestration" below).
 
 ```
                 ┌───────────────────────┐
@@ -16,36 +17,48 @@ what to pull next.
                 │  (scheduled, one-shot) │
                 └──────┬──────────┬──────┘
                        │          │
-                 READ  │          │ WRITE (transactional)
+                 READ  │          │ WRITE (transactional, per job)
                        ▼          ▼
-                 CCRISB2B         CBMS
-              usp_GetBCBNewData   BCB_NEW2, SyncRunHistory
-              (src_tblRetRpt,
-               src_tblCRARawReport)
+              each job's Source    each job's Target
+              (proc/SQL + params)  (table, SyncRunHistory)
 ```
+
+Today's one configured job (`BCB_NEW2`) reads `usp_GetBCBNewData` against CCRISB2B
+(`src_tblRetRpt`/`src_tblCRARawReport`) and writes `dbo.BCB_NEW2` in CBMS — unchanged
+from the pipeline described in
+`docs/superpowers/specs/2026-08-23-bcb-new2-pipeline-design.md`, now expressed as one
+entry in `Sync:Jobs` instead of hardcoded.
+
+### Multi-job orchestration
+
+`SyncEngine.RunAsync` acquires one process-level file lock covering the whole run,
+then runs every configured job in `Sync:Jobs`, in order. Each job is isolated: if one
+job's source is unreachable, its insert fails, or its source query's column count
+doesn't match its configured `Target.Columns`, that job is recorded as `Failed` and
+the run moves on to the next job rather than aborting. After all jobs finish, one
+aggregate failure email lists every job that failed in that run (not one email per
+job). The process exits non-zero if any job failed.
 
 ## Components (built)
 
 | Project | Responsibility |
 |---|---|
-| `CBMSB2BLink.Core` | Domain models, options, repository/notification interfaces, `SyncEngine` orchestration — no I/O. |
-| `CBMSB2BLink.Data` | SQL Server implementations (Dapper + `Microsoft.Data.SqlClient`) of the Core interfaces, plus `HttpSourceRepository` (fallback-bridge client). |
-| `CBMSB2BLink.Console` | Composition root: Generic Host, config binding + validation, Serilog, email, file-based run lock, source-mode selection (Sql/Http). |
-| `CBMSB2BLink.FallbackBridge.Api` | HTTP fallback bridge — wraps `usp_GetBCBNewData` over HTTP for when direct SQL to CCRISB2B is unreachable. Hosted near CCRISB2B. |
+| `CBMSB2BLink.Core` | Domain models, options (including `SyncJobOptions`), repository/notification interfaces, `SyncEngine` multi-job orchestration — no I/O. |
+| `CBMSB2BLink.Data` | SQL Server implementations (Dapper + `Microsoft.Data.SqlClient`, `SqlBulkCopy`) of the Core interfaces. |
+| `CBMSB2BLink.Console` | Composition root: Generic Host, config binding + validation, Serilog, email, file-based run lock. |
 | `CBMSB2BLink.Monitoring.Api` | Read-only monitoring dashboard/API over CBMS `SyncRunHistory`. |
-| `CBMSB2BLink.Tests` | `SyncEngine` orchestration tests, plus `HttpSourceRepository`/`ApiKeyAuth`/`HealthCalculator` tests, against mocked dependencies. |
+| `CBMSB2BLink.Tests` | `SyncEngine` multi-job orchestration tests, plus `HealthCalculator` tests, against mocked dependencies. |
 
 ## Tech stack
 
 | Layer | Choice | Where |
 |---|---|---|
-| Runtime | .NET 6 (`net6.0`), C# | all 5 projects |
-| Host | `Microsoft.Extensions.Hosting` Generic Host (console) / ASP.NET Core Minimal API (the two `.Api` projects) | `Console/Program.cs`, `FallbackBridge.Api/Program.cs`, `Monitoring.Api/Program.cs` |
-| Data access | Dapper 2.1.35 (queries + stored-proc calls) + raw ADO.NET (`Microsoft.Data.SqlClient` 5.2.2) for the table-valued-parameter insert | `CBMSB2BLink.Data` |
-| Database | SQL Server — two separate databases, `CCRISB2B` (source, read-only) and `CBMS` (destination, read/write) | — |
+| Runtime | .NET 6 (`net6.0`), C# | all 4 projects |
+| Host | `Microsoft.Extensions.Hosting` Generic Host (console) / ASP.NET Core Minimal API (`Monitoring.Api`) | `Console/Program.cs`, `Monitoring.Api/Program.cs` |
+| Data access | Dapper 2.1.35 (queries + stored-proc calls) + raw ADO.NET (`Microsoft.Data.SqlClient` 5.2.2, `SqlBulkCopy`) for the destination insert | `CBMSB2BLink.Data` |
+| Database | SQL Server — each job has its own source and target connection strings; today's one configured job uses two, `CCRISB2B` (source, read-only) and `CBMS` (destination, read/write) | — |
 | Logging | Serilog, console + rolling daily file sink (`Serilog.Sinks.File`), 30-day retention, enriched with machine name | `Console/appsettings.json` |
 | Email | MailKit 4.17.0 (SMTP), failure notifications only | `EmailNotificationService.cs` |
-| HTTP client (fallback path) | Typed `HttpClient` via `Microsoft.Extensions.Http` | `Data/HttpSourceRepository.cs` |
 | Scheduling | Windows Task Scheduler (primary); SQL Agent CmdExec job or a Windows Service timer are documented alternates, not built | `RUNBOOK.md` |
 | Tests | xUnit, `Moq` for interface mocks, ASP.NET's own `HttpMessageHandler` fake for HTTP tests | `CBMSB2BLink.Tests` |
 | Concurrency guard | Exclusive OS file lock (`FileStream` with `FileShare.None`), not a DB lock | `Console/Infrastructure/FileRunLock.cs` |
@@ -211,23 +224,20 @@ already marked sent by the proc) are now gone from both sides, not just delayed.
 If mark-on-read is the chosen pattern, make sure `MaxRunDurationSeconds` and
 `BatchSize` are sized with real headroom over expected backlog volume.
 
-## Why a TVP instead of `SqlBulkCopy`
+## Why `SqlBulkCopy` instead of a table-valued parameter
 
-`SqlBulkCopy` is the usual choice for bulk inserts, but doing the insert as a single
-`INSERT ... SELECT ... FROM @Records` statement lets one round trip carry the whole
-batch and still use `OUTPUT` to report back the exact `BCB_CMS_No` range that was
-inserted (for the `SyncRunHistory` row), inside the same transaction as the
-`SyncRunHistory` write. A table-valued parameter (`dbo.BcbRecordTableType`) is what
-makes that single round trip possible for a whole batch of rows rather than one
-`INSERT` per row.
-
-## Extension seam for the fallback bridge
-
-`ISourceRepository` is the only thing `SyncEngine` depends on to read new records. Two
-implementations exist: `SqlSourceRepository` (default, calls CCRISB2B directly) and
-`HttpSourceRepository` (calls the fallback bridge). `Program.cs` picks one at startup
-based on `Sync:SourceMode` (`"Sql"` or `"Http"`) — `SyncEngine` itself is unchanged
-either way, since it only depends on the interface.
+Earlier revisions of this app used a hand-written SQL Server table type
+(`dbo.BcbRecordTableType`) matched exactly to one hardcoded destination table's
+columns, so `INSERT ... OUTPUT INSERTED.CMS_NO SELECT ... FROM @Records` could do the
+insert and report back a generated identity range in one round trip. That doesn't work
+once the destination table (and its column list) is config, not code — there's no
+per-job SQL Server type to write by hand. `SqlBulkCopy` needs no such type: it maps
+the in-memory `DataTable`'s columns to `Target.Columns` positionally at runtime. The
+key range it reports back is computed from the `DataTable` itself before the insert
+even runs (the key is always the source's first column, copied straight through, never
+a target-generated identity) — see
+`docs/superpowers/specs/2026-08-24-generic-sync-engine-design.md`, "Why no
+OUTPUT-based identity capture".
 
 ---
 
@@ -258,40 +268,15 @@ Queries run through `SyncStatusReader` (Dapper, its own CBMS connection) — del
 not through `CBMSB2BLink.Data`'s write-side repositories, since dashboard reads are a
 different shape than what `ISyncRunHistoryRepository` exposes for the sync engine.
 
-## HTTP fallback bridge (built)
+## HTTP fallback bridge (removed)
 
-When direct SQL access to CCRISB2B isn't available (network segmentation, firewall,
-maintenance window), `CBMSB2BLink.FallbackBridge.Api` — a small API **hosted near
-CCRISB2B** — wraps `usp_GetBCBNewData` over HTTP:
-
-```
-                 (SQL unreachable)
-CBMSB2BLink  ────────X────────►  CCRISB2B
-     │                                ▲
-     │ HTTP (Sync:SourceMode=Http)    │ direct SQL
-     ▼                                │
-  Fallback Bridge API ────────────────┘
-  (hosted on/near CCRISB2B network)
-```
-
-- Contract: `GET /api/bcb-new?lastRowId={n}&batchSize={n}` → JSON array of
-  `{ rowId, bcbCmsNo, bcbIdNo1, bcbIdNo2, bcbName1, bcbDob, bcbNationality,
-  bcbCreateDate, bcbLastUpdateBy, bcbEntKey, bcbRefNo, bcbScrScoredTxnCode }`
-  (camelCase), ordered ascending, capped at `batchSize` — same shape
-  `usp_GetBCBNewData` returns, whatever its actual filtering logic is (the bridge just
-  forwards `lastRowId`/`batchSize` to the same proc call `SqlSourceRepository` makes).
-  401 on a missing/wrong `X-Api-Key` header, 400 on invalid query params.
-- The bridge **reuses `SqlSourceRepository` as-is** (same project, same interface) —
-  it's the same "call `usp_GetBCBNewData`" logic already used and tested by the
-  direct-SQL path, just wrapped in an HTTP endpoint instead of called in-process. No
-  duplicated proc-calling code.
-- Auth: a shared API key, sent as `X-Api-Key`, compared with a constant-time check
-  (`ApiKeyAuth.IsAuthorized`, unit tested) to avoid a timing side-channel.
-- Client side: `HttpSourceRepository : ISourceRepository` (in `CBMSB2BLink.Data`) calls
-  this endpoint via a typed `HttpClient`. `Program.cs` registers it instead of
-  `SqlSourceRepository` when `Sync:SourceMode=Http`. **Manual switch only** — an
-  operator sets this during a known outage; there's no automatic failover-on-N-failures.
-  That would be a reasonable follow-up but wasn't built, to keep the mode switch simple
-  and predictable (no risk of silently flapping between modes).
-- The CBMS side stays the write path in both modes — the bridge only replaces how new
-  rows are *read*, not how they're inserted.
+An earlier revision had `CBMSB2BLink.FallbackBridge.Api` — a small API hosted near
+CCRISB2B that wrapped `usp_GetBCBNewData` over HTTP for when direct SQL to CCRISB2B
+wasn't reachable, with `HttpSourceRepository : ISourceRepository` as its client side
+and a `Sync:SourceMode=Http` switch to select it. Both were **removed** when the sync
+engine generalized to multi-job (`Sync:Jobs`, see
+`docs/superpowers/specs/2026-08-24-generic-sync-engine-design.md`, decision 11) —
+`ISourceRepository`'s contract changed shape (`DataTable`, job-scoped connection
+strings) and the fallback bridge depended on the old one. There is only one source
+mode now: direct SQL, via `SqlSourceRepository`. Reintroducing an HTTP fallback would
+be a reasonable follow-up, generalized for the job-based shape, but wasn't rebuilt.

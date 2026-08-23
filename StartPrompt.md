@@ -17,7 +17,7 @@ CBMSB2BLink Windows Console
                        │     │
                        ▼     ▼
                 CCRISB2B     CBMS
-     src_tblRetRpt/src_tblCRARawReport (see sql/source_CCRISB2B_01.sql)     BCB_NEW2 (BCB_CMS_No, BCB_IdNo1, ... — see sql/01_CreateSyncRunHistory_CBMS.sql)
+     src_tblRetRpt/src_tblCRARawReport (see sql/source_CCRISB2B_01.sql)     BCB_NEW2 (columns listed in Sync:Jobs[0].Target.Columns, appsettings.json)
 
 1. Read config
 
@@ -34,10 +34,10 @@ CBMSB2BLink Windows Console
 
 5. Connect CBMS
 
-6. Bulk insert into:
-   BCB_NEW2
-
-7. Update SyncControl
+6. For each configured job (Sync:Jobs), in order:
+   - Bulk insert its pulled rows into its own Target.Table (SqlBulkCopy)
+   - Append a SyncRunHistory row in that job's own target database
+   - One job failing doesn't stop the others
 
 8. Write logs
 
