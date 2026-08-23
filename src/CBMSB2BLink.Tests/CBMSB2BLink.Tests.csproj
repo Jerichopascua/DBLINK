@@ -11,6 +11,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
     <PackageReference Include="Moq" Version="4.20.72" />
+    <PackageReference Include="System.Net.Http.Json" Version="6.0.1" />
     <PackageReference Include="xunit" Version="2.6.6" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.5.7">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
@@ -25,6 +26,7 @@
   <ItemGroup>
     <ProjectReference Include="..\CBMSB2BLink.Core\CBMSB2BLink.Core.csproj" />
     <ProjectReference Include="..\CBMSB2BLink.Data\CBMSB2BLink.Data.csproj" />
+    <ProjectReference Include="..\CBMSB2BLink.Monitoring.Api\CBMSB2BLink.Monitoring.Api.csproj" />
   </ItemGroup>
 
 </Project>
