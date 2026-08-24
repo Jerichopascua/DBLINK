@@ -16,15 +16,21 @@ namespace CBMSB2BLink.Core;
 /// <summary>
 /// Orchestrates one CBMSB2BLink run: acquire one process-level lock, then run every
 /// configured job in Sync:Jobs, in order, isolated (one job failing does not stop the
-/// others). CBMSB2BLink does not track a resume watermark itself for any job — each
-/// job's source query is responsible for knowing what's already been sent (see
-/// ISourceRepository).
+/// others). Each job's resume position is tracked in its own target database
+/// (dbo.CbmsB2BLink_ResumeCursor, see IResumeCursorRepository) — read once at the
+/// start of the run to seed @LastRowId, then PullAllPagesAsync pages through the
+/// source query (job.BatchSize per call) until a short/empty page comes back,
+/// advancing @LastRowId to each page's last RowID along the way. The watermark is
+/// then advanced to the final cursor on success. @LastRowId is the only dedup
+/// mechanism now (the source query has no sent-log of its own) — the source query's
+/// own filtering is expected to be strictly increasing with RowID.
 /// </summary>
 public sealed class SyncEngine
 {
     private readonly ISourceRepository _sourceRepository;
     private readonly IDestinationRepository _destinationRepository;
     private readonly ISyncRunHistoryRepository _syncRunHistoryRepository;
+    private readonly IResumeCursorRepository _resumeCursorRepository;
     private readonly ITargetUnitOfWorkFactory _unitOfWorkFactory;
     private readonly INotificationService _notificationService;
     private readonly IRunLock _runLock;
@@ -35,6 +41,7 @@ public sealed class SyncEngine
         ISourceRepository sourceRepository,
         IDestinationRepository destinationRepository,
         ISyncRunHistoryRepository syncRunHistoryRepository,
+        IResumeCursorRepository resumeCursorRepository,
         ITargetUnitOfWorkFactory unitOfWorkFactory,
         INotificationService notificationService,
         IRunLock runLock,
@@ -44,6 +51,7 @@ public sealed class SyncEngine
         _sourceRepository = sourceRepository;
         _destinationRepository = destinationRepository;
         _syncRunHistoryRepository = syncRunHistoryRepository;
+        _resumeCursorRepository = resumeCursorRepository;
         _unitOfWorkFactory = unitOfWorkFactory;
         _notificationService = notificationService;
         _runLock = runLock;
@@ -101,8 +109,10 @@ public sealed class SyncEngine
             _logger.LogInformation("Starting sync for {JobKey}", job.JobKey);
 
             await _syncRunHistoryRepository.EnsureSchemaAsync(job.Target.ConnectionString, cancellationToken);
+            await _resumeCursorRepository.EnsureSchemaAsync(job.Target.ConnectionString, cancellationToken);
 
-            var batch = await PullAllPagesAsync(job, cancellationToken);
+            var seedCursor = await _resumeCursorRepository.GetLastRowIdAsync(job.Target.ConnectionString, job.JobKey, cancellationToken);
+            var batch = await PullAllPagesAsync(job, seedCursor, cancellationToken);
             result.RecordsRead = batch.Rows.Count;
 
             if (batch.Rows.Count == 0)
@@ -110,7 +120,7 @@ public sealed class SyncEngine
                 _logger.LogInformation("No new records for {JobKey}.", job.JobKey);
                 result.Status = SyncRunStatus.NoNewData;
                 result.CompletedUtc = DateTime.UtcNow;
-                result.DurationMs = (int)stopwatch.ElapsedMilliseconds;
+                result.DurationSeconds = stopwatch.Elapsed.TotalSeconds;
 
                 await using var noopUow = _unitOfWorkFactory.Create(job.Target.ConnectionString);
                 await noopUow.InitializeAsync(cancellationToken);
@@ -137,14 +147,15 @@ public sealed class SyncEngine
 
                 result.Status = SyncRunStatus.Success;
                 result.CompletedUtc = DateTime.UtcNow;
-                result.DurationMs = (int)stopwatch.ElapsedMilliseconds;
+                result.DurationSeconds = stopwatch.Elapsed.TotalSeconds;
 
                 await _syncRunHistoryRepository.RecordRunAsync(uow, result, cancellationToken);
+                await _resumeCursorRepository.SetLastRowIdAsync(uow, job.JobKey, result.SourceRowIdTo!.Value, cancellationToken);
                 await uow.CommitAsync(cancellationToken);
 
                 _logger.LogInformation(
-                    "Sync succeeded for {JobKey}: {RecordsInserted} records, RowId {From}-{To}, {DurationMs}ms",
-                    job.JobKey, result.RecordsInserted, result.SourceRowIdFrom, result.SourceRowIdTo, result.DurationMs);
+                    "Sync succeeded for {JobKey}: {RecordsInserted} records, RowId {From}-{To}, {DurationSeconds}s",
+                    job.JobKey, result.RecordsInserted, result.SourceRowIdFrom, result.SourceRowIdTo, result.DurationSeconds);
 
                 return result;
             }
@@ -160,7 +171,7 @@ public sealed class SyncEngine
             result.Status = SyncRunStatus.Failed;
             result.ErrorMessage = ex.ToString();
             result.CompletedUtc = DateTime.UtcNow;
-            result.DurationMs = (int)stopwatch.ElapsedMilliseconds;
+            result.DurationSeconds = stopwatch.Elapsed.TotalSeconds;
 
             await TryRecordFailedRunAsync(job, result, cancellationToken);
             return result;
@@ -168,16 +179,21 @@ public sealed class SyncEngine
     }
 
     /// <summary>
-    /// Pulls every page for one job. Every page's column count is checked against
-    /// job.Target.Columns.Count before it's used — a mismatch (page 1, or any later
-    /// page if the source query's shape ever varies by parameter) fails the job
-    /// immediately with a clear error, no partial work and no raw ImportRow schema
-    /// exception.
+    /// Pulls pages for one job, starting from seedCursor (dbo.CbmsB2BLink_ResumeCursor's
+    /// current value — the cross-run resume point). job.BatchSize is the chunk size
+    /// requested per call, not a cap on the run: SyncEngine keeps calling with the
+    /// cursor advanced to each page's last RowID until a page comes back smaller than
+    /// BatchSize (or empty), meaning there's nothing left — OR until the accumulated
+    /// total reaches job.BatchAllowedMaxRecord, whichever comes first; anything left
+    /// beyond that cap waits for the next run. Every page's column count is checked
+    /// against job.Target.Columns.Count before it's used — a mismatch fails the job
+    /// immediately with a clear error, no partial work.
     /// </summary>
-    private async Task<DataTable> PullAllPagesAsync(SyncJobOptions job, CancellationToken cancellationToken)
+    private async Task<DataTable> PullAllPagesAsync(SyncJobOptions job, long seedCursor, CancellationToken cancellationToken)
     {
         DataTable? all = null;
-        var cursor = 0L;
+        var cursor = seedCursor;
+        var totalRows = 0;
 
         while (true)
         {
@@ -201,6 +217,8 @@ public sealed class SyncEngine
                 }
             }
 
+            totalRows += page.Rows.Count;
+
             if (page.Rows.Count == 0)
             {
                 break;
@@ -210,6 +228,14 @@ public sealed class SyncEngine
 
             if (page.Rows.Count < job.BatchSize)
             {
+                break;
+            }
+
+            if (totalRows >= job.BatchAllowedMaxRecord)
+            {
+                _logger.LogInformation(
+                    "Job {JobKey}: reached BatchAllowedMaxRecord ({Max}) after {TotalRows} rows — stopping for this run; the rest resumes on the next run.",
+                    job.JobKey, job.BatchAllowedMaxRecord, totalRows);
                 break;
             }
         }

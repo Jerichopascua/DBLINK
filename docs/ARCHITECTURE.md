@@ -4,12 +4,18 @@
 
 CBMSB2BLink is a scheduled .NET 6 Windows console app that runs a configured list of
 independent sync jobs (`Sync:Jobs`), each copying new rows from its own source
-database/query into its own target table. It keeps **no resume watermark of its own**
-for any job — each job's source query is responsible for knowing what's already been
-sent and excluding it. CBMSB2BLink only writes an audit trail of what each job's run
-did (`SyncRunHistory`, in that job's own target database) — that table is history, not
-something the app reads back to decide what to pull next. One job failing does not
-stop the others in the same run (see "Multi-job orchestration" below).
+database/query into its own target table. Each job keeps a resume watermark
+(`dbo.CbmsB2BLink_ResumeCursor`, one row per `JobKey`) in its own target database —
+read once at the start of the run to seed `@LastRowId` for the first page, then
+advanced to the final cursor on every success (see "CBMS-side resume watermark"
+below). `@LastRowId` is now the **only** dedup mechanism in the whole pipeline — the
+source query (`usp_GetBCBNewData`) has no sent-log or mark-on-read tracking of its own
+any more, so correctness depends entirely on `@LastRowId` strictly increasing, both
+within a run's paging loop and across runs via the watermark. CBMSB2BLink also writes
+an audit trail of what each job's run did (`SyncRunHistory`, in that job's own target
+database) — that table stays history-only, not something the app reads back to decide
+what to pull next. One job failing does not stop the others in the same run (see
+"Multi-job orchestration" below).
 
 ```
                 ┌───────────────────────┐
@@ -75,17 +81,18 @@ service platform.
    racing each other's inserts, on top of Task Scheduler's own "do not start a new
    instance" setting. If the lock is already held, the run exits immediately with a
    `Failed`/skipped result — it does **not** wait or retry.
-2. **Pull new rows from CCRISB2B, one page at a time** — `SqlSourceRepository`
-   opens a `SqlConnection` to CCRISB2B and calls `EXEC usp_GetBCBNewData
-   @LastRowId, @BatchSize` (Dapper `QueryAsync`, `CommandType.StoredProcedure`).
-   **`@LastRowId` starts at `0` on every run** — CBMSB2BLink has no cross-run
-   watermark to seed it from. The proc itself is responsible for excluding rows it's
-   already sent (see "No CBMS-side watermark" below); CBMSB2BLink just keeps calling
-   it. `SyncEngine.PullAllPagesAsync` loops — each returned page is appended to one
-   in-memory `List<BcbRecord>`, and `@LastRowId` advances *within this run only* to
-   that page's last `ROWID`, purely so a multi-page pull doesn't re-request the same
-   page — until a page comes back **smaller** than `BatchSize` (meaning there's
-   nothing left) or the loop times out (see "Capacity & limits" below).
+2. **Pull new rows from CCRISB2B, one page at a time** —
+   `SyncEngine.RunJobAsync` first reads the job's watermark
+   (`IResumeCursorRepository.GetLastRowIdAsync`, `dbo.CbmsB2BLink_ResumeCursor` in the
+   **target** database) to seed `@LastRowId` for the first call only. Then
+   `SqlSourceRepository` opens a `SqlConnection` to CCRISB2B and calls
+   `EXEC usp_GetBCBNewData @LastRowId, @BatchSize`. `SyncEngine.PullAllPagesAsync`
+   loops — each returned page is appended to one in-memory `DataTable`, and
+   `@LastRowId` advances *within this run* to that page's last `RowID`, so the next
+   call picks up where the last one left off — until a page comes back **smaller**
+   than `BatchSize` (meaning there's nothing left) or the loop times out (see
+   "Capacity & limits" below). `BatchSize` is the chunk size requested per call, not a
+   cap on the run — a run keeps calling until it has drained everything available.
 3. **If nothing new**: record a `NoNewData` row in `SyncRunHistory` and exit 0 —
    no CBMS write.
 4. **Otherwise, one CBMS transaction** (`CbmsUnitOfWork`, a single `SqlConnection` +
@@ -111,29 +118,54 @@ service platform.
    commit), send a failure email via MailKit, and exit non-zero so Task Scheduler /
    SQL Agent can flag the run.
 
-### No CBMS-side watermark — this is deliberate
+### CBMS-side resume watermark — the only dedup mechanism now, accepted risk
 
 Earlier revisions of this app kept a `dbo.SyncControl` table in CBMS (`LastRowId`,
 `LastCmsNo`) that CBMSB2BLink read at the start of each run and advanced on success.
-That table has been **removed**. The decision was to keep resume/dedup logic entirely
-on the CCRISB2B side, inside `usp_GetBCBNewData` (or whatever replaces it) —
-CBMSB2BLink is now a thin "call the proc, insert what it returns, log it" pipeline with
-no opinion about what counts as "new." See "Failure & recovery scenarios" below for
-what this means operationally, and `sql/02_usp_GetBCBNewData_CCRISB2B.sql`'s own
-comments for the mark-on-read tracking pattern the proc implements via
-`dbo.CbmsB2BLink_SentLog`.
+That table was removed at one point in favor of keeping resume/dedup logic entirely on
+the CCRISB2B side — for a while, `usp_GetBCBNewData` tracked "already sent" itself via
+`NOT EXISTS` against `dbo.CbmsB2BLink_SentLog` (mark-on-read). A near-equivalent
+watermark table has since been **reintroduced** in CBMS —
+`dbo.CbmsB2BLink_ResumeCursor` (`sql/04_CreateCbmsB2BLinkResumeCursor_CBMS.sql`, one
+row per `JobKey`) — and, separately, `usp_GetBCBNewData` was rewritten to drop
+`CbmsB2BLink_SentLog` entirely (that table has been dropped from CCRISB2B). So today
+**`@LastRowId`/`dbo.CbmsB2BLink_ResumeCursor` is the only thing preventing a row from
+being sent twice** — there is no independent sent-log backstop any more.
+
+- **Read**: `SyncEngine.RunJobAsync` reads the watermark via
+  `IResumeCursorRepository.GetLastRowIdAsync` once at the start of the run, to seed
+  `@LastRowId` for the *first* page only — `PullAllPagesAsync`'s loop then advances
+  `@LastRowId` locally for subsequent pages within that same run (see step 2 above).
+- **Auto-advance**: on every successful run, `IResumeCursorRepository.SetLastRowIdAsync`
+  upserts the watermark to that run's `SourceRowIdTo` (the last page's last `RowID`),
+  in the **same transaction** as the `BCB_NEW2` insert and the `SyncRunHistory` row —
+  so it only advances when the insert actually committed.
+- **Manual override**: ops can run `UPDATE dbo.CbmsB2BLink_ResumeCursor SET LastRowId =
+  ... WHERE JobKey = ...` directly at any time to force a specific resume point (rewind
+  to reprocess a range, or fast-forward past a known-bad one) — there is no separate
+  override column or app-side mechanism; the app always just reads whatever value is
+  currently in the table.
+
+**Accepted risk**: this carries the exact failure mode the original `dbo.SyncControl`
+watermark had, now with no `SentLog` safety net underneath it. If a row's eligibility
+can flip from "not yet ready" to "ready" *after* a higher `RowID` has already been
+synced (e.g. a status column populated asynchronously post-insert), that lower-`RowID`
+row is skipped **forever** once `@LastRowId` passes it — nothing in the current
+`usp_GetBCBNewData` re-checks rows below the cursor. This is only safe if the source
+query's eligibility is monotonic with `RowID` (once a `RowID` has been passed, nothing
+below it can later become newly eligible).
 
 ## Where the data lives during a run — is it bulk-loaded into memory?
 
 Yes, entirely in memory, and only for the duration of one run — there is **no
 staging table, no temp file, no queue**. The full chain:
 
-- CCRISB2B rows come back from Dapper as plain C# objects (`BcbRecordRow` →
-  mapped to `BcbRecord`), held in a `List<BcbRecord>` that accumulates **every
-  page** pulled during that run (`SyncEngine.PullAllPagesAsync`, `all.AddRange(page)`).
-  Nothing is written to disk or handed off between pages.
-- At insert time, that same list is copied into an in-memory ADO.NET `DataTable`
-  (`SqlDestinationRepository.InsertBatchAsync`) and streamed to SQL Server as one
+- CCRISB2B rows come back as ADO.NET `DataTable` pages
+  (`SyncEngine.PullAllPagesAsync` → `SqlSourceRepository.GetNewRecordsAsync`), and
+  every page pulled during the run is merged into one in-memory `DataTable`
+  (`DataTable.ImportRow`). Nothing is written to disk or handed off between pages.
+- At insert time, that same `DataTable` is handed to
+  `SqlDestinationRepository.InsertBatchAsync` and streamed to SQL Server as one
   table-valued parameter.
 - Once the transaction commits (or the process exits), that memory is released —
   nothing about the batch persists on the app side. The only durable record of
@@ -146,83 +178,65 @@ row size — see limits below.
 
 ## Capacity & limits
 
-There's no hardcoded cap on total records copied in one run. What actually bounds
-a run:
+What bounds a run — per job, since `BatchSize`/`BatchAllowedMaxRecord` live on
+`SyncJobOptions`:
 
 | Knob | Config | Default | Range | Effect |
 |---|---|---|---|---|
-| `Sync:BatchSize` | `SyncOptions.BatchSize` | 5,000 | 1–100,000 | Rows requested per `usp_GetBCBNewData` call (`TOP (@BatchSize)`). The HTTP fallback bridge independently re-validates the same 1–100,000 range and returns `400` outside it. |
-| `Sync:MaxRunDurationSeconds` | `SyncOptions.MaxRunDurationSeconds` | 1,800 (30 min) | 1–86,400 | A `CancellationTokenSource.CancelAfter(...)` set in `Program.cs` around the whole run. If paging + insert hasn't finished by then, the run is cancelled mid-flight. |
-| `Sync:CommandTimeoutSeconds` | `SyncOptions.CommandTimeoutSeconds` | 120 | 1–3,600 | Per-SQL-command timeout (each proc call, each insert) — a network hiccup on one page fails the run rather than hanging indefinitely. |
+| `Sync:Jobs[].BatchSize` | `SyncJobOptions.BatchSize` | 5,000 | 1–100,000 | Rows requested **per source call** (`TOP (@BatchSize)`, applied per branch in the current `usp_GetBCBNewData` — see its own notes on that). `SyncEngine.PullAllPagesAsync` keeps calling with this chunk size until a short/empty page comes back. |
+| `Sync:Jobs[].BatchAllowedMaxRecord` | `SyncJobOptions.BatchAllowedMaxRecord` | 100,000 | ≥ `BatchSize`, ≤ 10,000,000 | Hard cap on total rows accumulated across all pages **in one run**, for that job. `PullAllPagesAsync` stops as soon as this is reached, even if the last page was full and more data remains — the rest waits for the next run (resumed via `dbo.CbmsB2BLink_ResumeCursor`). A safety valve independent of `MaxRunDurationSeconds`, so one run can't pull an unbounded backlog into memory even if there's time left. |
+| `Sync:MaxRunDurationSeconds` | `SyncOptions.MaxRunDurationSeconds` | 1,800 (30 min) | 1–86,400 | A `CancellationTokenSource.CancelAfter(...)` set in `Program.cs` around the whole run (all jobs). If the paging + insert hasn't finished by then, the run is cancelled mid-flight. |
+| `Sync:Jobs[].CommandTimeoutSeconds` | `SyncJobOptions.CommandTimeoutSeconds` | 120 | 1–3,600 | Per-SQL-command timeout (each proc call, each insert) — a network hiccup on one page fails the run rather than hanging indefinitely. |
 
-So the real ceiling on "how much can one run copy" is **however many `BatchSize`
-pages fit inside `MaxRunDurationSeconds`**, all held in memory at once. There's no
-explicit "max total rows" setting; it's an emergent limit from batch size × time
-budget. If you expect a very large first-ever backlog (e.g. syncing years of
-history on day one), raise `BatchSize` (up to 100,000) and/or
-`MaxRunDurationSeconds` for that run, or just let it run multiple scheduled
-cycles — whether a later cycle picks up where an earlier one left off depends
-entirely on the source SP's own tracking (see previous section), not on anything
-CBMSB2BLink does.
+So the real ceiling on "how much can one run copy" for a given job is
+**`min(BatchAllowedMaxRecord, however many `BatchSize` pages fit inside the
+remaining `MaxRunDurationSeconds`)`**, all held in memory at once. If a job's
+backlog exceeds `BatchAllowedMaxRecord`, or a run can't finish an unusually large
+backlog inside `MaxRunDurationSeconds` and gets cancelled mid-flight and rolled back
+(see "Failure & recovery scenarios" below), the next run resumes from wherever
+`dbo.CbmsB2BLink_ResumeCursor` last successfully advanced to (see "CBMS-side resume
+watermark" above) — so a large backlog drains over multiple scheduled cycles either
+way.
 
 **Not yet re-measured under this pipeline**: an earlier version of this app (the
 retired `tblRPT`/`BCB_NEW` pipeline) was measured syncing a 500,000-row backlog
 end-to-end in 17.5 seconds against a local SQL Server instance. That number no longer
-applies to the current `src_tblRetRpt`/`BCB_NEW2` pipeline (different query shape, new
-`CbmsB2BLink_SentLog` dedup join) and hasn't been re-measured — treat the batch-size/
-duration knobs above as having comfortable headroom based on the old pipeline's
-numbers, not as a verified guarantee for this one, until someone re-runs the same kind
-of test against `sql/dev-seed-bigdata_CRARawReport_CCRISB2B_LocalTesting.sql`.
+applies to the current `src_tblRetRpt`/`BCB_NEW2` pipeline (different query shape) and
+hasn't been re-measured — treat the batch-size/duration knobs above as having
+comfortable headroom based on the old pipeline's numbers, not as a verified guarantee
+for this one, until someone re-runs the same kind of test against
+`sql/dev-seed-bigdata_CRARawReport_CCRISB2B_LocalTesting.sql`.
 
 ## Failure & recovery scenarios — what if the app doesn't run, or dies mid-run?
 
-Correctness here now splits across a hard boundary: **CBMS-side atomicity is
-guaranteed by this app; CCRISB2B-side "don't resend/don't lose" is entirely up to
-the source stored procedure.** CBMSB2BLink cannot make guarantees about a system it
-doesn't own the state of.
+Since `usp_GetBCBNewData` dropped its own sent-log (`dbo.CbmsB2BLink_SentLog` no
+longer exists), correctness now depends entirely on `dbo.CbmsB2BLink_ResumeCursor`
+only ever advancing when a run's CBMS write actually committed. The source query
+itself has no independent memory of what it's already returned — re-querying the same
+`@LastRowId` range twice legitimately returns the same rows twice.
 
 **1. The process crashes / is killed / the run times out mid-execution.**
-The CBMS insert and the `SyncRunHistory` row commit in one transaction (step 4
-above), so a crash at any point before `COMMIT` rolls back the entire
-transaction — CBMS ends up with **zero** partially-inserted rows for that run.
-That half is unconditionally safe, regardless of how the source proc works.
-
-  What happens to the rows CBMSB2BLink had already *read* from CCRISB2B before the
-  crash depends entirely on how the proc tracks "sent":
-  - If the proc marks rows sent only *after* confirming CBMSB2BLink successfully
-    processed them (a two-phase/ack pattern), those rows are naturally retried on
-    the next run — same safety as the old watermark design.
-  - If the proc marks rows sent **the moment they're read** (mark-on-read — the
-    simplest pattern, and what the local test scaffolding in
-    `sql/dev-seed_CCRISB2B_LocalTesting.sql` uses) — a crash *after* the source
-    read but *before* the CBMS commit means CCRISB2B now believes those rows were
-    sent, while CBMS never received them. **Those rows are permanently skipped**
-    unless something reconciles the two sides after the fact. This is a real
-    trade-off, not a bug — it buys simplicity on the source side at the cost of
-    losing at-least-once delivery across a destination failure. Worth deciding
-    deliberately when designing the real `usp_GetBCBNewData`, not defaulting into
-    it.
+The CBMS insert, the `SyncRunHistory` row, and the `CbmsB2BLink_ResumeCursor` upsert
+all commit in **one transaction** (step 4 above), so a crash at any point before
+`COMMIT` rolls back all three together — CBMS ends up with **zero**
+partially-inserted rows, and the watermark stays exactly where it was after the last
+successful run. Because nothing on the CCRISB2B side marks rows "sent" independently
+of that commit, the *next* run reads the *same* unadvanced watermark and naturally
+re-pulls and retries the exact same rows — there is no permanent-skip risk from a
+mid-run crash the way there was under the old mark-on-read `SentLog` design. The
+watermark's only real risk is the one described in "CBMS-side resume watermark"
+above: a *successful* run advancing past a `RowID` whose eligibility hadn't kicked in
+yet.
 
 **2. The scheduled task itself doesn't run for a day, two days, or longer**
 (host was down, Task Scheduler disabled, etc.) — this is the "data from
-yesterday / -2 days" case. Whether that backlog gets picked up cleanly on the
-next run is now a question for the source SP's own logic, not something
-CBMSB2BLink controls: CBMSB2BLink just keeps calling `usp_GetBCBNewData` with
-`@LastRowId = 0` until a page comes back short. If the proc's "unsent" query
-naturally includes everything that accumulated regardless of age, the backlog
-syncs in one run (paged, per "Capacity & limits" above) exactly as it did under
-the old watermark design. If the proc's tracking has its own staleness/retention
-assumptions, those now govern what actually gets caught up.
-
-**Caveat worth knowing operationally**: "make progress" is still all-or-nothing
-*per run* on the CBMS side — `PullAllPagesAsync` accumulates the whole batch the
-proc hands back into memory before a single row is written to CBMS, and the CBMS
-write is one transaction. A backlog large enough to blow `MaxRunDurationSeconds`
-produces **zero** inserted rows that cycle. Combined with a mark-on-read source
-proc, a run that times out mid-pull is worse than before: rows already read (and
-already marked sent by the proc) are now gone from both sides, not just delayed.
-If mark-on-read is the chosen pattern, make sure `MaxRunDurationSeconds` and
-`BatchSize` are sized with real headroom over expected backlog volume.
+yesterday / -2 days" case. `dbo.CbmsB2BLink_ResumeCursor` still holds wherever the
+last successful run left off, so the next run resumes from there and pages through
+the accumulated backlog (see "Capacity & limits" above) — draining the rest over
+subsequent runs if it doesn't all fit inside `MaxRunDurationSeconds`. Whether
+`usp_GetBCBNewData`'s eligibility rules still include everything from that far back is
+a separate question governed by the proc's own logic, not something CBMSB2BLink
+controls.
 
 ## Why `SqlBulkCopy` instead of a table-valued parameter
 

@@ -61,6 +61,11 @@ public sealed class SyncOptionsValidator : IValidateOptions<SyncOptions>
                 return ValidateOptionsResult.Fail($"{prefix}: BatchSize must be between 1 and 100000.");
             }
 
+            if (job.BatchAllowedMaxRecord < job.BatchSize || job.BatchAllowedMaxRecord > 10_000_000)
+            {
+                return ValidateOptionsResult.Fail($"{prefix}: BatchAllowedMaxRecord must be at least BatchSize ({job.BatchSize}) and at most 10000000.");
+            }
+
             if (job.CommandTimeoutSeconds is < 1 or > 3600)
             {
                 return ValidateOptionsResult.Fail($"{prefix}: CommandTimeoutSeconds must be between 1 and 3600.");

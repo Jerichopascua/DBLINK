@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CBMSB2BLink Monitoring</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --card-bg: #ffffff;
+    --text: #1a1d21;
+    --muted: #6b7280;
+    --border: #e2e4e8;
+    --ok: #1a7f37;
+    --ok-bg: #e6f6ea;
+    --bad: #b42318;
+    --bad-bg: #fdecec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --card-bg: #181b21;
+      --text: #e6e8eb;
+      --muted: #9aa1ab;
+      --border: #2a2e35;
+      --ok: #4ade80;
+      --ok-bg: #14291d;
+      --bad: #f87171;
+      --bad-bg: #2b1616;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 1.25rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+  header h1 { font-size: 1.1rem; margin: 0; }
+  header .controls { display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem; color: var(--muted); }
+  select {
+    font: inherit;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    color: var(--text);
+  }
+  main { padding: 1.5rem; max-width: 1100px; margin: 0 auto; }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.25rem;
+    margin-bottom: 1.25rem;
+  }
+  .status-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.25rem 0.65rem;
+    border-radius: 999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  .badge.healthy { color: var(--ok); background: var(--ok-bg); }
+  .badge.unhealthy { color: var(--bad); background: var(--bad-bg); }
+  .badge .dot { width: 0.5rem; height: 0.5rem; border-radius: 999px; background: currentColor; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; }
+  .stat .label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .stat .value { font-size: 1.3rem; font-weight: 600; margin-top: 0.15rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  tr:last-child td { border-bottom: none; }
+  .status-pill { padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+  .status-pill.Success { color: var(--ok); background: var(--ok-bg); }
+  .status-pill.Failed { color: var(--bad); background: var(--bad-bg); }
+  .status-pill.NoNewData { color: var(--muted); background: var(--border); }
+  .err { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+  .muted { color: var(--muted); }
+  .table-wrap { overflow-x: auto; }
+  footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 1rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CBMSB2BLink Monitoring</h1>
+  <div class="controls">
+    <label for="syncKey">Sync key</label>
+    <select id="syncKey"></select>
+    <span id="lastRefreshed"></span>
+  </div>
+</header>
+<main>
+  <section class="card">
+    <div class="status-row">
+      <span id="healthBadge" class="badge unhealthy"><span class="dot"></span><span id="healthText">Loading…</span></span>
+    </div>
+    <div class="grid">
+      <div class="stat"><div class="label">Last ROWID</div><div class="value" id="lastRowId">—</div></div>
+      <div class="stat"><div class="label">Last CMS_NO</div><div class="value" id="lastCmsNo">—</div></div>
+      <div class="stat"><div class="label">Last run status</div><div class="value" id="lastRunStatus">—</div></div>
+      <div class="stat"><div class="label">Last run</div><div class="value" id="lastRunAge">—</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th><th>Started (UTC)</th><th>Status</th><th>RowId range</th>
+            <th>CMS_NO range</th><th>Records</th><th>Duration</th><th>Error</th>
+          </tr>
+        </thead>
+        <tbody id="runsBody"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<footer>Auto-refreshes every 30s. Source: CBMS dbo.SyncRunHistory.</footer>
+
+<script>
+const syncKeySelect = document.getElementById('syncKey');
+let currentKey = null;
+
+async function loadSyncKeys() {
+  const res = await fetch('/api/sync-keys');
+  const keys = await res.json();
+  syncKeySelect.innerHTML = keys.map(k => `<option value="${k}">${k}</option>`).join('');
+  currentKey = keys[0];
+}
+
+function fmtDate(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso + (iso.endsWith('Z') ? '' : 'Z'));
+  return d.toLocaleString();
+}
+
+function fmtMinutesAgo(mins) {
+  if (mins === null || mins === undefined) return 'never';
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${Math.round(mins)} min ago`;
+  return `${(mins / 60).toFixed(1)} hr ago`;
+}
+
+async function refreshStatus() {
+  if (!currentKey) return;
+  const res = await fetch(`/api/status?syncKey=${encodeURIComponent(currentKey)}`);
+  if (!res.ok) return;
+  const s = await res.json();
+
+  const badge = document.getElementById('healthBadge');
+  const text = document.getElementById('healthText');
+  badge.className = 'badge ' + (s.isHealthy ? 'healthy' : 'unhealthy');
+  text.textContent = s.isHealthy ? 'Healthy' : 'Attention needed';
+
+  document.getElementById('lastRowId').textContent = s.lastRowId ?? '—';
+  document.getElementById('lastCmsNo').textContent = s.lastCmsNo ?? '—';
+  document.getElementById('lastRunStatus').textContent = s.lastRunStatus ?? '—';
+  document.getElementById('lastRunAge').textContent = fmtMinutesAgo(s.minutesSinceLastRun);
+}
+
+async function refreshRuns() {
+  if (!currentKey) return;
+  const res = await fetch(`/api/runs?syncKey=${encodeURIComponent(currentKey)}&take=50`);
+  if (!res.ok) return;
+  const runs = await res.json();
+
+  document.getElementById('runsBody').innerHTML = runs.map(r => `
+    <tr>
+      <td>${r.runId}</td>
+      <td>${fmtDate(r.startedUtc)}</td>
+      <td><span class="status-pill ${r.status}">${r.status}</span></td>
+      <td>${r.sourceRowIdFrom ?? '—'}${r.sourceRowIdTo ? '–' + r.sourceRowIdTo : ''}</td>
+      <td>${r.cmsNoFrom ?? '—'}${r.cmsNoTo ? '–' + r.cmsNoTo : ''}</td>
+      <td>${r.recordsInserted}/${r.recordsRead}</td>
+      <td>${r.durationSeconds != null ? r.durationSeconds.toFixed(2) : '—'} s</td>
+      <td class="err muted" title="${(r.errorMessage || '').replace(/"/g, '&quot;')}">${r.errorMessage ? r.errorMessage.split('\n')[0] : '—'}</td>
+    </tr>
+  `).join('');
+}
+
+async function refreshAll() {
+  await refreshStatus();
+  await refreshRuns();
+  document.getElementById('lastRefreshed').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
+syncKeySelect.addEventListener('change', () => {
+  currentKey = syncKeySelect.value;
+  refreshAll();
+});
+
+loadSyncKeys().then(refreshAll);
+setInterval(refreshAll, 30000);
+</script>
+</body>
+</html>

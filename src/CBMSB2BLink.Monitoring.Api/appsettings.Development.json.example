@@ -1,0 +1,5 @@
+{
+  "ConnectionStrings": {
+    "Cbms": "Server=YOUR_SERVER\\SQLEXPRESS;Database=CBMS;User Id=sa;Password=YOUR_PASSWORD;TrustServerCertificate=True;"
+  }
+}

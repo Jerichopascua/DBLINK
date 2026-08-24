@@ -36,7 +36,18 @@ public sealed class SyncJobOptions
 
     public TargetJobOptions Target { get; set; } = new();
 
+    /// <summary>Rows requested per source call — the paging chunk size.</summary>
     public int BatchSize { get; set; } = 5000;
+
+    /// <summary>
+    /// Hard cap on total rows one run will accumulate for this job across all pages.
+    /// SyncEngine.PullAllPagesAsync stops paging once this many rows have been
+    /// pulled, even if the last page was full and more data remains — the rest waits
+    /// for the next run (resumed via dbo.CbmsB2BLink_ResumeCursor). A safety valve
+    /// independent of Sync:MaxRunDurationSeconds, so one run can't accidentally pull
+    /// an unbounded backlog into memory.
+    /// </summary>
+    public int BatchAllowedMaxRecord { get; set; } = 100_000;
 
     public int CommandTimeoutSeconds { get; set; } = 120;
 }

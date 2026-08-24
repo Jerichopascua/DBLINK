@@ -1,3 +1,9 @@
+select * from src_tblRetRpt
+src_tblCRARawReport
+
+
+src_tblCRARawReport
+
 -- 1. Parent Table: CRA Raw Report
 CREATE TABLE dbo.src_tblCRARawReport (
     RowID                  INT IDENTITY(1,1) NOT NULL,
@@ -148,3 +154,22 @@ WHERE b.Status = 'OK'
         AND d.DateResponse >= CONVERT(DATETIME, CONVERT(VARCHAR, GETDATE()-1, 106))
         AND d.DateResponse < CONVERT(DATETIME, CONVERT(VARCHAR, GETDATE(), 106))
   );
+
+
+
+
+  CREATE TABLE dbo.BCB_NEW2 (
+    BCB_CMS_No             INT NULL,
+    BCB_IdNo1              VARCHAR(50) NULL,
+    BCB_IdNo2              VARCHAR(50) NULL,
+    BCB_Name1              VARCHAR(255) NULL,
+    BCB_DOB                VARCHAR(10) NULL,        -- Formatted as DD/MM/YYYY
+    BCB_Nationality        VARCHAR(10) NULL,        -- e.g., 'MY'
+    BCB_CreateDate         DATETIME NULL,           -- e.g., '2015-01-28 15:57:30.980'
+    BCB_LastUpdateBy       VARCHAR(20) NULL,        -- e.g., 'BATCH'
+    BCB_ENTKEY             VARCHAR(20) NULL,        -- e.g., '00004156547'
+    BCB_RefNo              VARCHAR(20) NULL,        -- e.g., '0000019634'
+    BCB_SCR_Scored_TxnCode VARCHAR(10) NULL,        -- e.g., 'USC' / 'SCP'
+    BCB_STATUS             VARCHAR(50) NULL,
+    BCB_CMS_Status         VARCHAR(50) NULL
+);

@@ -5,8 +5,9 @@ using System.Threading.Tasks;
 namespace CBMSB2BLink.Core.Abstractions;
 
 /// <summary>
-/// Guards against an overlapping scheduled run racing the watermark. Defense in depth on
-/// top of Task Scheduler's "do not start a new instance" setting.
+/// Guards against an overlapping scheduled run racing another run's insert/history
+/// writes. Defense in depth on top of Task Scheduler's "do not start a new instance"
+/// setting.
 /// </summary>
 public interface IRunLock
 {

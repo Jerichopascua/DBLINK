@@ -26,5 +26,5 @@ public sealed class SyncRunResult
     public int RecordsInserted { get; set; }
     public string? ErrorMessage { get; set; }
     public string HostMachine { get; init; } = Environment.MachineName;
-    public int? DurationMs { get; set; }
+    public double? DurationSeconds { get; set; }
 }

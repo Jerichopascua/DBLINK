@@ -85,7 +85,7 @@ public sealed class SyncStatusReader
             @"SELECT TOP (@Take)
                   RunId, SyncKey, StartedUtc, CompletedUtc, Status,
                   SourceRowIdFrom, SourceRowIdTo, CmsNoFrom, CmsNoTo,
-                  RecordsRead, RecordsInserted, ErrorMessage, HostMachine, DurationMs
+                  RecordsRead, RecordsInserted, ErrorMessage, HostMachine, DurationSeconds
               FROM dbo.SyncRunHistory
               WHERE SyncKey = @SyncKey
               ORDER BY RunId DESC;",

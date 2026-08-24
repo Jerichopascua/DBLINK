@@ -50,7 +50,7 @@ BEGIN
         RecordsInserted INT           NOT NULL CONSTRAINT DF_SyncRunHistory_RecordsInserted DEFAULT (0),
         ErrorMessage    NVARCHAR(MAX) NULL,
         HostMachine     VARCHAR(100)  NULL,
-        DurationMs      INT           NULL
+        DurationSeconds FLOAT         NULL
     );
 
     CREATE INDEX IX_SyncRunHistory_SyncKey_StartedUtc ON dbo.SyncRunHistory (SyncKey, StartedUtc DESC);
@@ -59,10 +59,10 @@ END";
     private const string InsertRunHistorySql = @"
 INSERT INTO dbo.SyncRunHistory
     (SyncKey, StartedUtc, CompletedUtc, Status, SourceRowIdFrom, SourceRowIdTo,
-     CmsNoFrom, CmsNoTo, RecordsRead, RecordsInserted, ErrorMessage, HostMachine, DurationMs)
+     CmsNoFrom, CmsNoTo, RecordsRead, RecordsInserted, ErrorMessage, HostMachine, DurationSeconds)
 VALUES
     (@SyncKey, @StartedUtc, @CompletedUtc, @Status, @SourceRowIdFrom, @SourceRowIdTo,
-     @CmsNoFrom, @CmsNoTo, @RecordsRead, @RecordsInserted, @ErrorMessage, @HostMachine, @DurationMs);";
+     @CmsNoFrom, @CmsNoTo, @RecordsRead, @RecordsInserted, @ErrorMessage, @HostMachine, @DurationSeconds);";
 
     private static object ToParams(SyncRunResult result) => new
     {
@@ -78,6 +78,6 @@ VALUES
         result.RecordsInserted,
         result.ErrorMessage,
         result.HostMachine,
-        result.DurationMs
+        result.DurationSeconds
     };
 }

@@ -15,6 +15,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ISourceRepository, SqlSourceRepository>();
         services.AddSingleton<IDestinationRepository, SqlDestinationRepository>();
         services.AddSingleton<ISyncRunHistoryRepository, SqlSyncRunHistoryRepository>();
+        services.AddSingleton<IResumeCursorRepository, SqlResumeCursorRepository>();
         services.AddSingleton<ITargetUnitOfWorkFactory, TargetUnitOfWorkFactory>();
         return services;
     }

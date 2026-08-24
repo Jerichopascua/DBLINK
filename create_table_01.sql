@@ -1,0 +1,50 @@
+-- Table structure for tblDtlRpt_Header
+CREATE TABLE src_tblDtlRpt_Header (
+    RowID INT IDENTITY(1,1) PRIMARY KEY,
+    CCRIS_Status VARCHAR(50) NULL,
+    CCRIS_Error VARCHAR(MAX) NULL,
+    CCRIS_Warning VARCHAR(MAX) NULL,
+    FromYear INT NULL,
+    ToYear INT NULL,
+    M1 VARCHAR(50) NULL,
+    M2 VARCHAR(50) NULL,
+    M3 VARCHAR(50) NULL,
+    M4 VARCHAR(50) NULL,
+    M5 VARCHAR(50) NULL,
+    M6 VARCHAR(50) NULL,
+    M7 VARCHAR(50) NULL,
+    M8 VARCHAR(50) NULL,
+    M9 VARCHAR(50) NULL,
+    M10 VARCHAR(50) NULL,
+    M11 VARCHAR(50) NULL,
+    M12 VARCHAR(50) NULL,
+    LimTot DECIMAL(18, 2) NULL,
+    BalTot DECIMAL(18, 2) NULL,
+    SpecialName VARCHAR(255) NULL
+);
+
+-- Table structure for tblCRARawReport
+CREATE TABLE src_tblCRARawReport (
+    RowID INT IDENTITY(1,1) PRIMARY KEY,
+    DateResponse DATETIME NULL,
+    Status VARCHAR(50) NULL,
+    ErrorMessage VARCHAR(MAX) NULL,
+    B2BErrorMessage VARCHAR(MAX) NULL,
+    FromYear INT NULL,
+    ToYear INT NULL,
+    M1 VARCHAR(50) NULL,
+    M2 VARCHAR(50) NULL,
+    M3 VARCHAR(50) NULL,
+    M4 VARCHAR(50) NULL,
+    M5 VARCHAR(50) NULL,
+    M6 VARCHAR(50) NULL,
+    M7 VARCHAR(50) NULL,
+    M8 VARCHAR(50) NULL,
+    M9 VARCHAR(50) NULL,
+    M10 VARCHAR(50) NULL,
+    M11 VARCHAR(50) NULL,
+    M12 VARCHAR(50) NULL,
+    TotalLimit DECIMAL(18, 2) NULL,
+    TotalOutstanding DECIMAL(18, 2) NULL,
+    SpecialName VARCHAR(255) NULL
+);

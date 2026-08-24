@@ -19,6 +19,7 @@ public class SyncEngineTests
     private readonly Mock<ISourceRepository> _source = new();
     private readonly Mock<IDestinationRepository> _destination = new();
     private readonly Mock<ISyncRunHistoryRepository> _syncRunHistory = new();
+    private readonly Mock<IResumeCursorRepository> _resumeCursor = new();
     private readonly Mock<ITargetUnitOfWorkFactory> _uowFactory = new();
     private readonly Mock<ITargetUnitOfWork> _uow = new();
     private readonly Mock<INotificationService> _notification = new();
@@ -31,24 +32,29 @@ public class SyncEngineTests
             .ReturnsAsync(Mock.Of<IDisposable>());
 
         _uowFactory.Setup(x => x.Create(It.IsAny<string>())).Returns(_uow.Object);
+
+        _resumeCursor.Setup(x => x.GetLastRowIdAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(0L);
     }
 
     private SyncEngine CreateEngine() => new(
         _source.Object,
         _destination.Object,
         _syncRunHistory.Object,
+        _resumeCursor.Object,
         _uowFactory.Object,
         _notification.Object,
         _runLock.Object,
         Options.Create(_options),
         NullLogger<SyncEngine>.Instance);
 
-    private static SyncJobOptions Job(string jobKey, int batchSize = 10) => new()
+    private static SyncJobOptions Job(string jobKey, int batchSize = 10, int? batchAllowedMaxRecord = null) => new()
     {
         JobKey = jobKey,
         Source = new SourceJobOptions { ConnectionString = "source-cs", CommandText = $"usp_Test_{jobKey}", CommandType = "StoredProcedure" },
         Target = new TargetJobOptions { ConnectionString = "target-cs", Table = "dbo.Target", Columns = new List<string> { "KeyCol", "NameCol" } },
         BatchSize = batchSize,
+        BatchAllowedMaxRecord = batchAllowedMaxRecord ?? 100_000,
         CommandTimeoutSeconds = 30
     };
 
@@ -195,6 +201,72 @@ public class SyncEngineTests
         _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), 0, 2, It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
         _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), 2, 2, It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
         _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), 3, 2, It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task RunAsync_ReachesBatchAllowedMaxRecord_StopsPagingEarly()
+    {
+        // batchSize: 2, cap: 2 — the first page is "full" (2 rows == BatchSize, which
+        // would normally continue the loop), but it also already hits the cap, so
+        // there must be no second call even though more data (Page(3, 4)) is queued.
+        _options.Jobs = new List<SyncJobOptions> { Job("JOB1", batchSize: 2, batchAllowedMaxRecord: 2) };
+
+        _source.SetupSequence(x => x.GetNewRecordsAsync(
+                It.Is<SourceJobOptions>(s => s.CommandText == "usp_Test_JOB1"),
+                It.IsAny<long>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Page(1, 2))
+            .ReturnsAsync(Page(3, 4));
+
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 2), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 2 });
+
+        var engine = CreateEngine();
+        var results = await engine.RunAsync(CancellationToken.None);
+
+        Assert.Equal(SyncRunStatus.Success, results[0].Status);
+        Assert.Equal(2, results[0].RecordsRead);
+        Assert.Equal(2, results[0].SourceRowIdTo);
+        _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), It.IsAny<long>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task RunAsync_SeededResumeCursor_FirstPageStartsFromIt()
+    {
+        _resumeCursor.Setup(x => x.GetLastRowIdAsync("target-cs", "JOB1", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(500L);
+        SetupSource("usp_Test_JOB1", Page(501));
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 1 });
+
+        var engine = CreateEngine();
+        var results = await engine.RunAsync(CancellationToken.None);
+
+        Assert.Equal(SyncRunStatus.Success, results[0].Status);
+        _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), 500, It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task RunAsync_Success_AdvancesResumeCursorToSourceRowIdTo()
+    {
+        SetupSource("usp_Test_JOB1", Page(101, 102, 103));
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 3 });
+
+        var engine = CreateEngine();
+        await engine.RunAsync(CancellationToken.None);
+
+        _resumeCursor.Verify(x => x.SetLastRowIdAsync(_uow.Object, "JOB1", 103, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task RunAsync_NoNewData_DoesNotAdvanceResumeCursor()
+    {
+        SetupSource("usp_Test_JOB1", Page());
+
+        var engine = CreateEngine();
+        await engine.RunAsync(CancellationToken.None);
+
+        _resumeCursor.Verify(x => x.SetLastRowIdAsync(It.IsAny<ITargetUnitOfWork>(), It.IsAny<string>(), It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
