@@ -38,18 +38,35 @@ has surrounding context).
 
 ## Re-syncing a gap in CBMS
 
-There's no watermark to reset here — CBMSB2BLink always asks the source proc for
-"what's new" starting from `@LastRowId = 0` and trusts whatever it gets back (see
-ARCHITECTURE.md, "No CBMS-side watermark"). If CBMS is confirmed missing rows that
-CCRISB2B has, the fix has to happen on the **CCRISB2B side**: whatever mechanism
-`usp_GetBCBNewData` uses to track "already sent" (a status flag, a sent-timestamp,
-etc.) needs those specific rows marked as un-sent again, so the next run's query
-picks them up. Coordinate with whoever owns that proc — CBMSB2BLink has no way to
-force a re-pull of a specific `ROWID` range on its own.
+CBMSB2BLink computes each run's starting `@LastRowId` by reading
+`MAX(SourceRowIdTo)` from `dbo.SyncRunHistory` for that job's `JobKey` (`Status =
+'Success'` rows only) — **not** from the target business table's own data (see
+`ARCHITECTURE.md`, "CBMS-side resume cursor", for why: a BAU target's key column can
+be a server-generated `IDENTITY` unrelated to the source `RowID`, so reading the
+target directly isn't reliable in general). That means re-syncing a gap means
+adjusting `SyncRunHistory`, not the target table:
 
-Also worth checking before assuming rows were lost: `BCB_NEW` has no unique
-constraint tying a row back to its source `ROWID` today, so if a re-send does happen,
-confirm it won't create duplicates for rows that already made it through.
+- **Gap at the tail** (the most recent rows are missing): delete the `SyncRunHistory`
+  rows for that job whose `SourceRowIdTo` is at or above where the gap starts (or, to
+  be surgical, `UPDATE` the relevant row's `SourceRowIdTo` down instead of deleting
+  it). The next run's `MAX(SourceRowIdTo)` drops accordingly, and
+  `usp_GetBCBNewData` will return everything above that again — assuming its own
+  eligibility window (date range, status filter, etc.) still covers those `RowID`s.
+  Check that before assuming a re-sync will actually surface them.
+- **Gap in the middle** (some rows below the current max are missing, but newer rows
+  already synced fine): lowering the cursor to before the gap means **everything**
+  above the gap gets re-pulled too, not just the missing rows — confirm the target
+  table won't end up with duplicates for rows that already made it through (no unique
+  constraint ties a row back to its source `RowID` today, on most target tables)
+  before doing this.
+- Either way, if CCRISB2B's own eligibility window has already moved past those rows
+  (e.g. a "yesterday only" filter), adjusting `SyncRunHistory` alone won't bring them
+  back — that part has to be fixed on the **CCRISB2B side**, coordinating with
+  whoever owns `usp_GetBCBNewData`. CBMSB2BLink has no way to force the source proc
+  to return a specific `RowID` range on its own.
+- Deleting/editing rows in the actual target table (e.g. removing genuinely bad rows)
+  has **no effect** on the resume cursor either way now — `SyncRunHistory` is the only
+  thing that matters for "where does the next run start."
 
 ## Interpreting a failure email
 

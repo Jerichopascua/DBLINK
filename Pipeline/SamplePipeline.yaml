@@ -1,0 +1,87 @@
+# Runs the numbered migration scripts in sql/ (e.g. 01_..., 02_...) against either
+# the local SQL Express instance or a cloud SQL server, in order.
+#
+# Scripts ending in "_LocalTesting.sql" (dev-only seed data) are always skipped,
+# regardless of environment.
+#
+# Setup required before running this pipeline:
+#   1. Create variable groups "dblink-local-sql" and "dblink-cloud-sql" in
+#      Azure DevOps (Pipelines > Library), each containing:
+#        SqlServer   e.g. JMPASCUADESKTOP\SQLEXPRESS   (or your cloud server FQDN)
+#        SqlDatabase e.g. CCRISB2B
+#        SqlUser     e.g. sa
+#        SqlPassword marked as secret (the "lock" icon) - never commit this value
+#   2. Register a self-hosted agent (pool "Default") on or near the machine hosting
+#      the local SQL Server, since Microsoft-hosted agents cannot reach a private
+#      desktop instance. Both "local" and "cloud" runs use this same pool, since a
+#      self-hosted agent on your network can typically reach a cloud SQL server too.
+
+name: Run-SQL-Scripts-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+parameters:
+  - name: environment
+    displayName: Target environment
+    type: string
+    default: local
+    values:
+      - local
+      - cloud
+
+pool:
+  name: Default
+
+variables:
+  - ${{ if eq(parameters.environment, 'local') }}:
+      - group: dblink-local-sql
+  - ${{ if eq(parameters.environment, 'cloud') }}:
+      - group: dblink-cloud-sql
+
+steps:
+  - checkout: self
+
+  - task: PowerShell@2
+    displayName: 'Install SqlServer PowerShell module (if missing)'
+    inputs:
+      targetType: inline
+      script: |
+        if (-not (Get-Module -ListAvailable -Name SqlServer)) {
+          Write-Host "Installing SqlServer module..."
+          Install-Module -Name SqlServer -Scope CurrentUser -Force -AllowClobber -MinimumVersion 21.0.0
+        } else {
+          Write-Host "SqlServer module already present."
+        }
+
+  - task: PowerShell@2
+    displayName: 'Run sql/ migration scripts against ${{ parameters.environment }}'
+    env:
+      SQL_PASSWORD: $(SqlPassword)
+    inputs:
+      targetType: inline
+      script: |
+        Import-Module SqlServer
+
+        $scripts = Get-ChildItem -Path "$(Build.SourcesDirectory)/sql" -Filter '*.sql' |
+          Where-Object { $_.Name -match '^\d+_' -and $_.Name -notmatch '_LocalTesting\.sql$' } |
+          Sort-Object { [int]([regex]::Match($_.Name, '^\d+')).Value }
+
+        if ($scripts.Count -eq 0) {
+          Write-Warning "No matching scripts found in sql/."
+          exit 0
+        }
+
+        foreach ($script in $scripts) {
+          Write-Host "----- Running $($script.Name) -----"
+          Invoke-Sqlcmd `
+            -ServerInstance "$(SqlServer)" `
+            -Database "$(SqlDatabase)" `
+            -Username "$(SqlUser)" `
+            -Password $env:SQL_PASSWORD `
+            -TrustServerCertificate `
+            -InputFile $script.FullName `
+            -ErrorAction Stop
+        }
+
+        Write-Host "All scripts completed successfully."

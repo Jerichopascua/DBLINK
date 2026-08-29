@@ -16,7 +16,7 @@ this config shape implements.
 | | `Jobs` | Array of job objects (see below). At least one required. | — required |
 | `Sync:Jobs[]` | `JobKey` | Identifies this job in `SyncRunHistory` (its `SyncKey` column) and in log lines/failure emails. | — required |
 | | `Source.ConnectionString` | This job's source database connection string. | — required |
-| | `Source.CommandText` | Stored procedure name, or raw SQL text when `CommandType` is `"Text"`. Must accept `@LastRowId BIGINT` and `@BatchSize INT`, and itself exclude rows already returned in a prior call (CBMSB2BLink keeps no watermark of its own — see `docs/ARCHITECTURE.md`, "No CBMS-side watermark"). | — required |
+| | `Source.CommandText` | Stored procedure name, or raw SQL text when `CommandType` is `"Text"`. Must accept `@LastRowId BIGINT` and `@BatchSize INT`, and itself only return rows with a key greater than `@LastRowId` — CBMSB2BLink computes the resume cursor from `dbo.SyncRunHistory` (`MAX(SourceRowIdTo)` for the job), not from the target table's own data, each page — see `docs/ARCHITECTURE.md`, "CBMS-side resume cursor". | — required |
 | | `Source.CommandType` | `"StoredProcedure"` (default) or `"Text"`. | `"StoredProcedure"` |
 | | `Target.ConnectionString` | This job's target database connection string. | — required |
 | | `Target.Table` | Schema-qualified target table, e.g. `"dbo.BCB_NEW2"`. | — required |

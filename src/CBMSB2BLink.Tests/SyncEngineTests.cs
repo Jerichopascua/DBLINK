@@ -180,7 +180,42 @@ public class SyncEngineTests
     }
 
     [Fact]
-    public async Task RunAsync_MultiPageBatch_PagesUntilPartialPage()
+    public async Task RunAsync_SecondPageFails_FirstPageStaysCommitted()
+    {
+        // This is the actual point of committing per page: page 1's insert + commit
+        // must not be undone just because page 2 later fails.
+        _options.Jobs = new List<SyncJobOptions> { Job("JOB1", batchSize: 2) };
+
+        _source.SetupSequence(x => x.GetNewRecordsAsync(
+                It.Is<SourceJobOptions>(s => s.CommandText == "usp_Test_JOB1"),
+                It.IsAny<long>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Page(1, 2))
+            .ReturnsAsync(Page(3, 4));
+
+        _resumeCursor.SetupSequence(x => x.GetLastRowIdAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(0L)
+            .ReturnsAsync(2L);
+
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 2 && (long)t.Rows[0][0] == 1), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 2 });
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 2 && (long)t.Rows[0][0] == 3), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("insert failed on page 2"));
+
+        var engine = CreateEngine();
+        var results = await engine.RunAsync(CancellationToken.None);
+
+        Assert.Equal(SyncRunStatus.Failed, results[0].Status);
+
+        // Page 1: committed once, never rolled back.
+        _syncRunHistory.Verify(x => x.RecordRunAsync(_uow.Object, It.Is<SyncRunResult>(r => r.Status == SyncRunStatus.Success && r.SourceRowIdTo == 2), It.IsAny<CancellationToken>()), Times.Once);
+        _uow.Verify(x => x.CommitAsync(It.IsAny<CancellationToken>()), Times.Once);
+        // Page 2: rolled back, then the whole job recorded as Failed on a separate connection.
+        _uow.Verify(x => x.RollbackAsync(It.IsAny<CancellationToken>()), Times.Once);
+        _syncRunHistory.Verify(x => x.RecordFailedRunAsync("target-cs", It.IsAny<SyncRunResult>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task RunAsync_MultiPageBatch_CommitsEachPageAndRequeriesCursorBetweenPages()
     {
         _options.Jobs = new List<SyncJobOptions> { Job("JOB1", batchSize: 2) };
 
@@ -190,17 +225,35 @@ public class SyncEngineTests
             .ReturnsAsync(Page(1, 2))
             .ReturnsAsync(Page(3));
 
-        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 3), It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 3 });
+        // Simulates SyncRunHistory's MAX(SourceRowIdTo) actually advancing after page 1
+        // commits — this is what re-querying the cursor before every page (not just
+        // once per run) is meant to reflect.
+        _resumeCursor.SetupSequence(x => x.GetLastRowIdAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(0L)
+            .ReturnsAsync(2L);
+
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 2), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 2 });
+        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 1), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 1 });
 
         var engine = CreateEngine();
         var results = await engine.RunAsync(CancellationToken.None);
 
         Assert.Equal(SyncRunStatus.Success, results[0].Status);
         Assert.Equal(3, results[0].RecordsRead);
+        Assert.Equal(3, results[0].RecordsInserted);
+        Assert.Equal(1, results[0].SourceRowIdFrom);
+        Assert.Equal(3, results[0].SourceRowIdTo);
+
         _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), 0, 2, It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
         _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), 2, 2, It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
-        _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), 3, 2, It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
+
+        // Each page inserted and recorded in its own transaction, not accumulated into one.
+        _destination.Verify(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 2), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
+        _destination.Verify(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.Is<DataTable>(t => t.Rows.Count == 1), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
+        _syncRunHistory.Verify(x => x.RecordRunAsync(_uow.Object, It.Is<SyncRunResult>(r => r.Status == SyncRunStatus.Success), It.IsAny<CancellationToken>()), Times.Exactly(2));
+        _uow.Verify(x => x.CommitAsync(It.IsAny<CancellationToken>()), Times.Exactly(2));
     }
 
     [Fact]
@@ -230,8 +283,12 @@ public class SyncEngineTests
     }
 
     [Fact]
-    public async Task RunAsync_SeededResumeCursor_FirstPageStartsFromIt()
+    public async Task RunAsync_ResumeCursorFromSyncRunHistory_FirstPageStartsFromIt()
     {
+        // GetLastRowIdAsync is queried from dbo.SyncRunHistory (MAX(SourceRowIdTo) for
+        // this JobKey), not from the target table's own data — deliberately, since a
+        // BAU target's key column can be a server-generated IDENTITY unrelated to the
+        // source RowID (see IResumeCursorRepository's doc comment).
         _resumeCursor.Setup(x => x.GetLastRowIdAsync("target-cs", "JOB1", It.IsAny<CancellationToken>()))
             .ReturnsAsync(500L);
         SetupSource("usp_Test_JOB1", Page(501));
@@ -243,30 +300,6 @@ public class SyncEngineTests
 
         Assert.Equal(SyncRunStatus.Success, results[0].Status);
         _source.Verify(x => x.GetNewRecordsAsync(It.IsAny<SourceJobOptions>(), 500, It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
-    }
-
-    [Fact]
-    public async Task RunAsync_Success_AdvancesResumeCursorToSourceRowIdTo()
-    {
-        SetupSource("usp_Test_JOB1", Page(101, 102, 103));
-        _destination.Setup(x => x.InsertBatchAsync(_uow.Object, "dbo.Target", It.IsAny<IReadOnlyList<string>>(), It.IsAny<DataTable>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new InsertBatchResult { RecordsInserted = 3 });
-
-        var engine = CreateEngine();
-        await engine.RunAsync(CancellationToken.None);
-
-        _resumeCursor.Verify(x => x.SetLastRowIdAsync(_uow.Object, "JOB1", 103, It.IsAny<CancellationToken>()), Times.Once);
-    }
-
-    [Fact]
-    public async Task RunAsync_NoNewData_DoesNotAdvanceResumeCursor()
-    {
-        SetupSource("usp_Test_JOB1", Page());
-
-        var engine = CreateEngine();
-        await engine.RunAsync(CancellationToken.None);
-
-        _resumeCursor.Verify(x => x.SetLastRowIdAsync(It.IsAny<ITargetUnitOfWork>(), It.IsAny<string>(), It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]

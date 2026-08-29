@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Data;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
@@ -16,14 +15,22 @@ namespace CBMSB2BLink.Core;
 /// <summary>
 /// Orchestrates one CBMSB2BLink run: acquire one process-level lock, then run every
 /// configured job in Sync:Jobs, in order, isolated (one job failing does not stop the
-/// others). Each job's resume position is tracked in its own target database
-/// (dbo.CbmsB2BLink_ResumeCursor, see IResumeCursorRepository) — read once at the
-/// start of the run to seed @LastRowId, then PullAllPagesAsync pages through the
-/// source query (job.BatchSize per call) until a short/empty page comes back,
-/// advancing @LastRowId to each page's last RowID along the way. The watermark is
-/// then advanced to the final cursor on success. @LastRowId is the only dedup
-/// mechanism now (the source query has no sent-log of its own) — the source query's
-/// own filtering is expected to be strictly increasing with RowID.
+/// others). Each job is paged and committed **one page at a time**: before every
+/// single source call — not just once per run — SyncEngine re-reads
+/// IResumeCursorRepository.GetLastRowIdAsync (MAX(SourceRowIdTo) FROM
+/// dbo.SyncRunHistory, an app-owned table — deliberately NOT read from the target
+/// table's own data, since a BAU target's "key" column can be a server-generated
+/// IDENTITY unrelated to the source RowID) to seed that page's @LastRowId, pulls one
+/// page, inserts it, and commits it (insert + its own SyncRunHistory row) in one
+/// transaction before moving on to the next page. Because the SyncRunHistory row is
+/// written in the exact same transaction as the page's insert, the cursor can never
+/// drift from what was actually committed — this makes it self-healing at page
+/// granularity, not just run granularity: a crash after page 2 of 5 leaves pages 1-2
+/// durably committed, and the very next call (whether later in the same run or a
+/// fresh run) re-derives its starting point from SyncRunHistory. @LastRowId is the
+/// only dedup mechanism in the pipeline (the source query has no sent-log of its
+/// own) — the source query's own filtering is expected to be strictly increasing
+/// with RowID.
 /// </summary>
 public sealed class SyncEngine
 {
@@ -95,10 +102,18 @@ public sealed class SyncEngine
         return results;
     }
 
+    /// <summary>
+    /// Runs one job to completion: pages through its source, committing each page to
+    /// the target as soon as it's pulled (see class summary), until a short/empty page
+    /// comes back or job.BatchAllowedMaxRecord is reached. Returns one aggregate
+    /// SyncRunResult summarizing every page committed during this call — the
+    /// per-page detail lives in SyncRunHistory (one row per committed page), not in
+    /// this return value.
+    /// </summary>
     private async Task<SyncRunResult> RunJobAsync(SyncJobOptions job, CancellationToken cancellationToken)
     {
-        var stopwatch = Stopwatch.StartNew();
-        var result = new SyncRunResult
+        var runStopwatch = Stopwatch.StartNew();
+        var aggregate = new SyncRunResult
         {
             SyncKey = job.JobKey,
             StartedUtc = DateTime.UtcNow
@@ -109,138 +124,138 @@ public sealed class SyncEngine
             _logger.LogInformation("Starting sync for {JobKey}", job.JobKey);
 
             await _syncRunHistoryRepository.EnsureSchemaAsync(job.Target.ConnectionString, cancellationToken);
-            await _resumeCursorRepository.EnsureSchemaAsync(job.Target.ConnectionString, cancellationToken);
 
-            var seedCursor = await _resumeCursorRepository.GetLastRowIdAsync(job.Target.ConnectionString, job.JobKey, cancellationToken);
-            var batch = await PullAllPagesAsync(job, seedCursor, cancellationToken);
-            result.RecordsRead = batch.Rows.Count;
+            var pagesCommitted = 0;
+            var totalRead = 0;
+            var totalInserted = 0;
+            long? overallFrom = null;
+            long? overallTo = null;
 
-            if (batch.Rows.Count == 0)
+            while (true)
             {
-                _logger.LogInformation("No new records for {JobKey}.", job.JobKey);
-                result.Status = SyncRunStatus.NoNewData;
-                result.CompletedUtc = DateTime.UtcNow;
-                result.DurationSeconds = stopwatch.Elapsed.TotalSeconds;
+                var cursor = await _resumeCursorRepository.GetLastRowIdAsync(job.Target.ConnectionString, job.JobKey, cancellationToken);
 
-                await using var noopUow = _unitOfWorkFactory.Create(job.Target.ConnectionString);
-                await noopUow.InitializeAsync(cancellationToken);
-                await _syncRunHistoryRepository.RecordRunAsync(noopUow, result, cancellationToken);
-                await noopUow.CommitAsync(cancellationToken);
+                var pageStopwatch = Stopwatch.StartNew();
+                var page = await _sourceRepository.GetNewRecordsAsync(job.Source, cursor, job.BatchSize, job.CommandTimeoutSeconds, cancellationToken);
 
-                return result;
+                if (page.Columns.Count != job.Target.Columns.Count)
+                {
+                    throw new InvalidOperationException(
+                        $"Job {job.JobKey}: source query returned {page.Columns.Count} column(s) but Target.Columns configures {job.Target.Columns.Count}. Fix the job's Target.Columns list or the source query.");
+                }
+
+                if (page.Rows.Count == 0)
+                {
+                    if (pagesCommitted == 0)
+                    {
+                        _logger.LogInformation("No new records for {JobKey}.", job.JobKey);
+                        var noData = new SyncRunResult
+                        {
+                            SyncKey = job.JobKey,
+                            StartedUtc = aggregate.StartedUtc,
+                            Status = SyncRunStatus.NoNewData,
+                            CompletedUtc = DateTime.UtcNow,
+                            DurationSeconds = runStopwatch.Elapsed.TotalSeconds
+                        };
+
+                        await using var noopUow = _unitOfWorkFactory.Create(job.Target.ConnectionString);
+                        await noopUow.InitializeAsync(cancellationToken);
+                        await _syncRunHistoryRepository.RecordRunAsync(noopUow, noData, cancellationToken);
+                        await noopUow.CommitAsync(cancellationToken);
+
+                        return noData;
+                    }
+
+                    break;
+                }
+
+                var pageFrom = Convert.ToInt64(page.Rows[0][0]);
+                var pageTo = Convert.ToInt64(page.Rows[^1][0]);
+
+                var pageResult = new SyncRunResult
+                {
+                    SyncKey = job.JobKey,
+                    StartedUtc = DateTime.UtcNow,
+                    RecordsRead = page.Rows.Count,
+                    SourceRowIdFrom = pageFrom,
+                    SourceRowIdTo = pageTo
+                };
+
+                await using var uow = _unitOfWorkFactory.Create(job.Target.ConnectionString);
+                await uow.InitializeAsync(cancellationToken);
+                try
+                {
+                    var insertResult = await _destinationRepository.InsertBatchAsync(uow, job.Target.Table, job.Target.Columns, page, job.CommandTimeoutSeconds, cancellationToken);
+                    pageResult.RecordsInserted = insertResult.RecordsInserted;
+                    // The key is copied straight through from source column 0 to
+                    // Target.Columns[0], never target-generated — so the inserted range
+                    // is always identical to SourceRowIdFrom/To, already computed above.
+                    pageResult.CmsNoFrom = pageFrom;
+                    pageResult.CmsNoTo = pageTo;
+                    pageResult.Status = SyncRunStatus.Success;
+                    pageResult.CompletedUtc = DateTime.UtcNow;
+                    pageResult.DurationSeconds = pageStopwatch.Elapsed.TotalSeconds;
+
+                    await _syncRunHistoryRepository.RecordRunAsync(uow, pageResult, cancellationToken);
+                    await uow.CommitAsync(cancellationToken);
+
+                    _logger.LogInformation(
+                        "Page committed for {JobKey}: {RecordsInserted} records, RowId {From}-{To}, {DurationSeconds}s",
+                        job.JobKey, pageResult.RecordsInserted, pageFrom, pageTo, pageResult.DurationSeconds);
+                }
+                catch
+                {
+                    await uow.RollbackAsync(cancellationToken);
+                    throw;
+                }
+
+                pagesCommitted++;
+                totalRead += page.Rows.Count;
+                totalInserted += pageResult.RecordsInserted;
+                overallFrom ??= pageFrom;
+                overallTo = pageTo;
+
+                if (page.Rows.Count < job.BatchSize)
+                {
+                    break;
+                }
+
+                if (totalRead >= job.BatchAllowedMaxRecord)
+                {
+                    _logger.LogInformation(
+                        "Job {JobKey}: reached BatchAllowedMaxRecord ({Max}) after {TotalRows} rows — stopping for this run; the rest resumes on the next call.",
+                        job.JobKey, job.BatchAllowedMaxRecord, totalRead);
+                    break;
+                }
             }
 
-            result.SourceRowIdFrom = Convert.ToInt64(batch.Rows[0][0]);
-            result.SourceRowIdTo = Convert.ToInt64(batch.Rows[batch.Rows.Count - 1][0]);
+            aggregate.RecordsRead = totalRead;
+            aggregate.RecordsInserted = totalInserted;
+            aggregate.SourceRowIdFrom = overallFrom;
+            aggregate.SourceRowIdTo = overallTo;
+            aggregate.CmsNoFrom = overallFrom;
+            aggregate.CmsNoTo = overallTo;
+            aggregate.Status = SyncRunStatus.Success;
+            aggregate.CompletedUtc = DateTime.UtcNow;
+            aggregate.DurationSeconds = runStopwatch.Elapsed.TotalSeconds;
 
-            await using var uow = _unitOfWorkFactory.Create(job.Target.ConnectionString);
-            await uow.InitializeAsync(cancellationToken);
-            try
-            {
-                var insertResult = await _destinationRepository.InsertBatchAsync(uow, job.Target.Table, job.Target.Columns, batch, job.CommandTimeoutSeconds, cancellationToken);
-                result.RecordsInserted = insertResult.RecordsInserted;
-                // The key is copied straight through from source column 0 to
-                // Target.Columns[0], never target-generated — so the inserted range is
-                // always identical to SourceRowIdFrom/To, already computed above.
-                result.CmsNoFrom = result.SourceRowIdFrom;
-                result.CmsNoTo = result.SourceRowIdTo;
+            _logger.LogInformation(
+                "Sync succeeded for {JobKey}: {RecordsInserted} records across {PageCount} page(s), RowId {From}-{To}, {DurationSeconds}s",
+                job.JobKey, totalInserted, pagesCommitted, overallFrom, overallTo, aggregate.DurationSeconds);
 
-                result.Status = SyncRunStatus.Success;
-                result.CompletedUtc = DateTime.UtcNow;
-                result.DurationSeconds = stopwatch.Elapsed.TotalSeconds;
-
-                await _syncRunHistoryRepository.RecordRunAsync(uow, result, cancellationToken);
-                await _resumeCursorRepository.SetLastRowIdAsync(uow, job.JobKey, result.SourceRowIdTo!.Value, cancellationToken);
-                await uow.CommitAsync(cancellationToken);
-
-                _logger.LogInformation(
-                    "Sync succeeded for {JobKey}: {RecordsInserted} records, RowId {From}-{To}, {DurationSeconds}s",
-                    job.JobKey, result.RecordsInserted, result.SourceRowIdFrom, result.SourceRowIdTo, result.DurationSeconds);
-
-                return result;
-            }
-            catch
-            {
-                await uow.RollbackAsync(cancellationToken);
-                throw;
-            }
+            return aggregate;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Sync run failed for {JobKey}", job.JobKey);
-            result.Status = SyncRunStatus.Failed;
-            result.ErrorMessage = ex.ToString();
-            result.CompletedUtc = DateTime.UtcNow;
-            result.DurationSeconds = stopwatch.Elapsed.TotalSeconds;
+            aggregate.Status = SyncRunStatus.Failed;
+            aggregate.ErrorMessage = ex.ToString();
+            aggregate.CompletedUtc = DateTime.UtcNow;
+            aggregate.DurationSeconds = runStopwatch.Elapsed.TotalSeconds;
 
-            await TryRecordFailedRunAsync(job, result, cancellationToken);
-            return result;
+            await TryRecordFailedRunAsync(job, aggregate, cancellationToken);
+            return aggregate;
         }
-    }
-
-    /// <summary>
-    /// Pulls pages for one job, starting from seedCursor (dbo.CbmsB2BLink_ResumeCursor's
-    /// current value — the cross-run resume point). job.BatchSize is the chunk size
-    /// requested per call, not a cap on the run: SyncEngine keeps calling with the
-    /// cursor advanced to each page's last RowID until a page comes back smaller than
-    /// BatchSize (or empty), meaning there's nothing left — OR until the accumulated
-    /// total reaches job.BatchAllowedMaxRecord, whichever comes first; anything left
-    /// beyond that cap waits for the next run. Every page's column count is checked
-    /// against job.Target.Columns.Count before it's used — a mismatch fails the job
-    /// immediately with a clear error, no partial work.
-    /// </summary>
-    private async Task<DataTable> PullAllPagesAsync(SyncJobOptions job, long seedCursor, CancellationToken cancellationToken)
-    {
-        DataTable? all = null;
-        var cursor = seedCursor;
-        var totalRows = 0;
-
-        while (true)
-        {
-            var page = await _sourceRepository.GetNewRecordsAsync(job.Source, cursor, job.BatchSize, job.CommandTimeoutSeconds, cancellationToken);
-
-            if (page.Columns.Count != job.Target.Columns.Count)
-            {
-                throw new InvalidOperationException(
-                    $"Job {job.JobKey}: source query returned {page.Columns.Count} column(s) but Target.Columns configures {job.Target.Columns.Count}. Fix the job's Target.Columns list or the source query.");
-            }
-
-            if (all is null)
-            {
-                all = page;
-            }
-            else
-            {
-                foreach (DataRow row in page.Rows)
-                {
-                    all.ImportRow(row);
-                }
-            }
-
-            totalRows += page.Rows.Count;
-
-            if (page.Rows.Count == 0)
-            {
-                break;
-            }
-
-            cursor = Convert.ToInt64(page.Rows[page.Rows.Count - 1][0]);
-
-            if (page.Rows.Count < job.BatchSize)
-            {
-                break;
-            }
-
-            if (totalRows >= job.BatchAllowedMaxRecord)
-            {
-                _logger.LogInformation(
-                    "Job {JobKey}: reached BatchAllowedMaxRecord ({Max}) after {TotalRows} rows — stopping for this run; the rest resumes on the next run.",
-                    job.JobKey, job.BatchAllowedMaxRecord, totalRows);
-                break;
-            }
-        }
-
-        return all!;
     }
 
     private async Task TryRecordFailedRunAsync(SyncJobOptions job, SyncRunResult result, CancellationToken cancellationToken)
