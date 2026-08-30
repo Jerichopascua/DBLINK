@@ -15,7 +15,7 @@ INSERT INTO SyncRunHistory (
     HostMachine,
     DurationSeconds
 )
-SELECT TOP (5) 
+SELECT TOP (10) 
     SyncKey,
     StartedUtc,
     CompletedUtc,
@@ -29,6 +29,6 @@ SELECT TOP (5)
     ErrorMessage,
     HostMachine,
     DurationSeconds
-FROM SyncRunHistory ORDER BY 1;
+FROM SyncRunHistory;
 
 --SELECT * FROM SyncRunHistory ORDER BY 1 DESC

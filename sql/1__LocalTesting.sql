@@ -15,7 +15,7 @@ INSERT INTO SyncRunHistory (
     HostMachine,
     DurationSeconds
 )
-SELECT TOP (5) 
+SELECT TOP (15) 
     SyncKey,
     StartedUtc,
     CompletedUtc,
